@@ -1,0 +1,67 @@
+[tool.poetry]
+name = "video-gating-system"
+version = "1.0.0"
+description = "Real-time video gating system for intelligent frame processing with GPT-5"
+authors = ["Your Name <your.email@example.com>"]
+readme = "README.md"
+packages = [{include = "gates"}, {include = "utils"}]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+opencv-python = "^4.8.0"
+numpy = "^1.24.0"
+ultralytics = "^8.0.0"
+torch = ">=2.0.0"
+torchvision = ">=0.15.0"
+scipy = "^1.10.0"
+Pillow = "^9.5.0"
+openai = "^1.99.9"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^7.4.0"
+black = "^23.0.0"
+flake8 = "^6.0.0"
+mypy = "^1.5.0"
+
+[tool.poetry.group.optional.dependencies]
+onnxruntime = "^1.15.0"
+
+[tool.poetry.scripts]
+video-gating = "main:main"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.black]
+line-length = 88
+target-version = ['py310']
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+  # directories
+  \.eggs
+  | \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | build
+  | dist
+)/
+'''
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+minversion = "6.0"
+addopts = "-ra -q"
+testpaths = [
+    "tests",
+]

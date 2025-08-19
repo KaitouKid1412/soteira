@@ -1,0 +1,707 @@
+#!/usr/bin/env python3
+"""
+Real-time video gating system for intelligent frame processing.
+Implements 3-gate pipeline: Motion -> Scene-change -> Object-entry
+"""
+
+import argparse
+import signal
+import sys
+import time
+import csv
+import os
+from datetime import datetime
+from pathlib import Path
+import threading
+import queue
+
+import cv2
+import numpy as np
+import torch
+
+from gates.motion import MotionGate
+from gates.scene import SceneGate
+from gates.objects import ObjectGate
+from llm_sink import LLMSink
+from utils.timing import FPSCounter
+from utils.io import safe_mkdir, safe_write_image, get_async_saver, shutdown_async_saver
+from utils.image_quality import is_image_quality_good
+from utils.frame_buffer import FrameBuffer
+from utils.performance import FramePerformanceTracker
+from utils.video_streamer import VideoStreamer
+from utils.frame_sampler import AdaptiveFrameSampler, MotionBasedSampler
+
+
+class VideoGatingSystem:
+    def __init__(self, args):
+        self.args = args
+        self.save_dir = Path(args.save_dir)
+        safe_mkdir(self.save_dir)
+        
+        # Initialize CSV logging
+        self.csv_path = self.save_dir / "events_log.csv"
+        self.init_csv_log()
+        
+        # Initialize gates
+        self.motion_gate = MotionGate(threshold=args.motion_thresh)
+        self.scene_gate = SceneGate(
+            hist_threshold=args.scene_hist,
+            ssim_threshold=args.scene_ssim,
+            min_interval_ms=100  # Throttle scene detection to max 10 FPS
+        )
+        
+        # Device selection for object detection
+        if torch.backends.mps.is_available():
+            device = "mps"
+            print(f"Using Apple Metal (MPS) for object detection")
+        else:
+            device = "cpu"
+            print(f"Using CPU for object detection")
+            
+        self.object_gate = ObjectGate(
+            device=device,
+            confirm_hits=args.confirm_hits,
+            max_age_seconds=args.max_age_seconds,
+            imgsz=args.imgsz,
+            conf=args.conf,
+            iou=args.iou,
+            min_area_frac=args.min_area_frac,
+            classes=self.parse_classes(args.classes)
+        )
+        
+        # LLM sink with intelligent prompt transformation and parallel processing
+        self.llm_sink = LLMSink(
+            user_query=args.prompt,
+            openai_api_key=args.openai_api_key,
+            dry_run=args.dry_run,
+            num_workers=args.llm_workers
+        )
+        
+        # Timing and display
+        self.fps_counter = FPSCounter()
+        self.frame_count = 0  # Frames actually processed
+        self._total_frames_seen = 0  # Total frames from video (including dropped)
+        self.running = True
+        
+        # Frame buffer for quality capture
+        self.frame_buffer = FrameBuffer(max_pending=10, capture_timeout=3.0)
+        
+        # Performance tracking
+        self.perf_tracker = FramePerformanceTracker(save_dir=str(self.save_dir))
+        
+        # Async file saver for performance optimization
+        self.async_saver = get_async_saver()
+        
+        # High FPS optimization
+        if args.enable_60fps_mode:
+            self.frame_sampler = AdaptiveFrameSampler(
+                target_fps=args.target_fps,
+                min_fps=args.min_fps, 
+                max_fps=args.max_fps
+            )
+            self.enable_sampling = True
+            print(f"[60FPS] Enabled adaptive sampling: target {args.target_fps} FPS")
+        else:
+            self.frame_sampler = None
+            self.enable_sampling = False
+        
+        # Graceful shutdown state
+        self.shutdown_requested = False
+        self.shutdown_reason = ""
+        
+        # Event display state
+        self.scene_flash_until = 0
+        self.object_flash_until = 0
+        self.object_flash_id = None
+        
+    def parse_classes(self, classes_str):
+        if not classes_str:
+            return None
+        return [int(x.strip()) for x in classes_str.split(',')]
+    
+    def init_csv_log(self):
+        with open(self.csv_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['ts_iso', 'event_type', 'path', 'track_id_or_blank', 'd_hist', 'ssim', 'changed_ratio'])
+    
+    def log_event(self, event_type, path, track_id="", d_hist="", ssim="", changed_ratio=""):
+        ts_iso = datetime.now().isoformat()
+        with open(self.csv_path, 'a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([ts_iso, event_type, path, track_id, d_hist, ssim, changed_ratio])
+        print(f"[{ts_iso[:19]}] {event_type}: {path} (track_id={track_id})")
+    
+    def save_event_frame(self, frame, event_type, track_id=None):
+        # Check image quality first
+        is_good_quality, quality_metrics = is_image_quality_good(
+            frame,
+            blur_threshold=self.args.blur_threshold,
+            min_brightness=self.args.min_brightness,
+            max_brightness=self.args.max_brightness,
+            min_contrast=self.args.min_contrast
+        )
+        
+        if not is_good_quality:
+            print(f"[QUALITY] Skipping {event_type} - poor quality: blur={quality_metrics['blur_score']:.1f}, brightness={quality_metrics['brightness']:.1f}, contrast={quality_metrics['contrast']:.1f}")
+            return None
+        
+        ts = int(time.time() * 1000)
+        if track_id is not None:
+            filename = f"{event_type}_{track_id}_{ts}.jpg"
+        else:
+            filename = f"{event_type}_{ts}.jpg"
+        
+        path = self.save_dir / filename
+        safe_write_image(str(path), frame)
+        return str(path)
+    
+    def save_buffered_frame(self, frame, event_type, track_id=None, quality_metrics=None):
+        """Save a frame that was selected from the buffer."""
+        ts = int(time.time() * 1000)
+        if track_id is not None:
+            filename = f"{event_type}_{track_id}_{ts}.jpg"
+        else:
+            filename = f"{event_type}_{ts}.jpg"
+        
+        path = self.save_dir / filename
+        
+        # Use async saving for better performance
+        def save_callback(success):
+            if success and quality_metrics:
+                print(f"[BUFFER] Saved {event_type} frame: blur={quality_metrics['blur_score']:.1f}, brightness={quality_metrics['brightness']:.1f}, contrast={quality_metrics['contrast']:.1f}")
+            elif not success:
+                print(f"[BUFFER] Failed to save {event_type} frame: {path}")
+        
+        success = self.async_saver.save_image_async(str(path), frame, callback=save_callback)
+        
+        # Return path immediately (async save will happen in background)
+        return str(path) if success else None
+    
+    def draw_overlays(self, frame, motion_ratio, d_hist, ssim, detections):
+        h, w = frame.shape[:2]
+        
+        # Status text
+        status_y = 30
+        cv2.putText(frame, f"Motion: {motion_ratio:.3f}", (10, status_y), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        cv2.putText(frame, f"dHist: {d_hist:.3f}", (10, status_y + 25), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        cv2.putText(frame, f"SSIM: {ssim:.3f}", (10, status_y + 50), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+        cv2.putText(frame, f"FPS: {self.fps_counter.get_fps():.1f}", (10, status_y + 75), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.putText(frame, f"Buffer: {self.frame_buffer.get_pending_count()}", (10, status_y + 100), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
+        
+        # Detection boxes
+        for det in detections:
+            box = det['box']
+            track_id = det.get('track_id', -1)
+            conf = det['conf']
+            x1, y1, x2, y2 = map(int, box)
+            
+            # Draw bounding box
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            
+            # Draw track ID and confidence
+            label = f"ID:{track_id} {conf:.2f}"
+            cv2.putText(frame, label, (x1, y1 - 10), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+        
+        # Event flashes
+        now = time.time()
+        if now < self.scene_flash_until:
+            cv2.putText(frame, "SCENE CHANGE", (w//2 - 100, h//2), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 3)
+        
+        if now < self.object_flash_until and self.object_flash_id:
+            cv2.putText(frame, f"OBJECT ENTERED (id={self.object_flash_id})", 
+                       (w//2 - 150, h//2 + 50), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 0, 0), 3)
+    
+    def process_frame(self, frame):
+        self._total_frames_seen += 1  # Count every frame that enters processing
+        self.frame_count += 1  # Will be reset if frame is dropped
+        
+        # High FPS sampling check
+        if self.enable_sampling and not self.frame_sampler.should_process_frame():
+            self.frame_count -= 1  # Revert since this frame won't be processed
+            # Get specific reason for frame drop
+            drop_reason = self.frame_sampler.get_last_drop_reason()
+            dropped_count = self._total_frames_seen - self.frame_count
+            if dropped_count % 30 == 0:  # Log every 30th drop to avoid spam
+                print(f"[FRAME DROP] Total dropped: {dropped_count}, Reason: {drop_reason}")
+            return  # Skip this frame
+        
+        frame_start_time = time.time()
+        
+        # Detailed timing breakdown for bottleneck analysis
+        timing_breakdown = {}
+        last_time = frame_start_time
+        
+        # Resize frame - use smaller size for 60fps mode
+        if self.enable_sampling:
+            frame_small = cv2.resize(frame, (480, 270))  # Smaller for speed
+        else:
+            frame_small = cv2.resize(frame, (640, 360))
+        
+        current_time = time.time()
+        timing_breakdown['resize'] = (current_time - last_time) * 1000
+        last_time = current_time
+        
+        # Start performance tracking for this frame
+        self.perf_tracker.start_frame(self.frame_count)
+        
+        # Process frame buffer - handle any completed captures
+        buffer_start = time.time()
+        completed_captures = self.frame_buffer.process_frame(frame)
+        buffer_time = (time.time() - buffer_start) * 1000
+        for capture in completed_captures:
+            best_frame, quality_metrics = capture.get_best_frame()
+            if best_frame is not None:
+                # Save the best quality frame
+                save_start = time.time()
+                path = self.save_buffered_frame(best_frame, capture.event_type, capture.track_id, quality_metrics)
+                save_time = (time.time() - save_start) * 1000
+                if path:
+                    self.log_event(capture.event_type + "_change" if capture.event_type == "scene" else "object_entered", 
+                                 path, track_id=capture.track_id or "", 
+                                 changed_ratio=self.current_changed_ratio)
+                    
+                    # Enqueue to LLM
+                    llm_queued = False
+                    if not self.args.dry_run:
+                        llm_queued = self.llm_sink.enqueue_to_llm(self.args.prompt, path)
+                    
+                    # Record LLM event
+                    self.perf_tracker.record_llm_event(llm_queued or self.args.dry_run, self.llm_sink.get_queue_size())
+                    
+                    # Flash event
+                    if capture.event_type == "scene":
+                        self.scene_flash_until = time.time() + 1.0
+                    else:
+                        self.object_flash_until = time.time() + 1.0
+                        self.object_flash_id = capture.track_id
+            else:
+                print(f"[BUFFER] No good quality frame found for {capture.event_type}")
+        
+        # Store current changed ratio for logging
+        self.current_changed_ratio = 0.0
+        
+        if getattr(self.args, 'bypass_gates', False):
+            # Bypass mode: skip motion/scene detection entirely
+            changed_ratio = 0.0
+            d_hist, ssim = 0.0, 1.0
+            motion_spike = False
+            scene_changed = False
+        else:
+            # Gate 1: Motion (every frame)
+            with self.perf_tracker.time_gate('motion'):
+                changed_ratio, motion_mask = self.motion_gate.apply_motion(frame_small)
+                motion_spike = changed_ratio > self.args.motion_thresh
+            
+            self.current_changed_ratio = changed_ratio
+            self.perf_tracker.record_motion_result(motion_spike)
+            
+            # Gate 2: Scene change (only on motion spikes)
+            d_hist, ssim = 0.0, 1.0
+            scene_changed = False
+            
+            if motion_spike:
+                with self.perf_tracker.time_gate('scene'):
+                    scene_changed, d_hist, ssim = self.scene_gate.check_scene_change(frame_small)
+            
+            self.perf_tracker.record_scene_result(scene_changed)
+            
+            if scene_changed:
+                # Request buffered capture instead of immediate save
+                self.frame_buffer.request_capture(
+                    "scene", 
+                    frames_to_capture=self.args.buffer_frames,
+                    blur_threshold=self.args.blur_threshold,
+                    min_brightness=self.args.min_brightness,
+                    max_brightness=self.args.max_brightness,
+                    min_contrast=self.args.min_contrast,
+                    disable_quality_filter=self.args.disable_quality_filter,
+                    stop_on_good_frame=self.args.stop_on_good_frame
+                )
+        
+        # Gate 3: Object detection (only on motion spikes + scene changes)
+        detections = []
+        new_tracks = []
+        should_detect = (
+            motion_spike or
+            scene_changed
+        )
+        
+        if should_detect:
+            with self.perf_tracker.time_gate('object'):
+                detections, new_tracks = self.object_gate.process_frame(frame_small, frame)
+        
+        self.perf_tracker.record_object_result(len(detections))
+        
+        # Handle new object entries
+        for track in new_tracks:
+            track_id = track['id']
+            
+            # Request buffered capture for new object
+            self.frame_buffer.request_capture(
+                "enter", 
+                track_id=track_id,
+                frames_to_capture=self.args.buffer_frames,
+                blur_threshold=self.args.blur_threshold,
+                min_brightness=self.args.min_brightness,
+                max_brightness=self.args.max_brightness,
+                min_contrast=self.args.min_contrast,
+                disable_quality_filter=self.args.disable_quality_filter,
+                stop_on_good_frame=self.args.stop_on_good_frame
+            )
+        
+        # Display (optimized for high FPS)
+        if self.args.show:
+            display_frame = frame.copy()
+            self.draw_overlays(display_frame, changed_ratio, d_hist, ssim, detections)
+            cv2.imshow("Video Gating System", display_frame)
+            
+            # Non-blocking key check - important for maintaining video timing
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q') or key == 27:  # 'q' or ESC
+                self.request_shutdown("User pressed 'q' or ESC")
+        
+        # Check if graceful shutdown was requested
+        if self.shutdown_requested:
+            self.perform_graceful_shutdown()
+            return  # Exit main loop
+        
+        self.fps_counter.tick()
+        
+        # Add comprehensive frame statistics and timing breakdown (every 60 processed frames)
+        if self.frame_count % 60 == 0:
+            total_time = time.time() - frame_start_time
+            processing_fps = self.fps_counter.get_fps()
+            
+            # Calculate drop statistics
+            if hasattr(self, '_total_frames_seen'):
+                drop_rate = ((self._total_frames_seen - self.frame_count) / self._total_frames_seen) * 100
+                print(f"[FRAME STATS] Processed: {self.frame_count}, Seen: {self._total_frames_seen}, "
+                      f"Dropped: {self._total_frames_seen - self.frame_count} ({drop_rate:.1f}%), "
+                      f"Processing: {processing_fps:.1f} FPS, Frame time: {total_time*1000:.1f}ms")
+                      
+                # Show buffer timing if significant
+                if 'buffer_time' in locals() and buffer_time > 1.0:
+                    print(f"[BUFFER TIMING] Frame buffer processing: {buffer_time:.1f}ms")
+                if 'save_time' in locals() and save_time > 1.0:
+                    print(f"[SAVE TIMING] Frame saving: {save_time:.1f}ms")
+                    
+                # Show async save queue status
+                save_stats = self.async_saver.get_stats()
+                if save_stats['queue_size'] > 0:
+                    print(f"[ASYNC_SAVE] Queue: {save_stats['queue_size']}/50, "
+                          f"Completed: {save_stats['saves_completed']}, "
+                          f"Failed: {save_stats['saves_failed']}")
+            else:
+                print(f"[TIMING] Frame {self.frame_count}: {total_time*1000:.1f}ms processing, {processing_fps:.1f} FPS effective")
+        
+        # Record sampling performance
+        if self.enable_sampling:
+            processing_time = time.time() - frame_start_time
+            self.frame_sampler.record_processing_time(processing_time)
+        
+        # End performance tracking for this frame
+        self.perf_tracker.end_frame()
+    
+    def run(self):
+        # Setup video capture or streamer
+        source = self.args.source
+        cap = None
+        using_streamer = False
+        
+        # Check if source is a video file with streaming enabled
+        if hasattr(self.args, 'stream_video') and self.args.stream_video and not source.isdigit():
+            # Use video streamer for file input
+            try:
+                speed = getattr(self.args, 'stream_speed', 1.0)
+                loop = getattr(self.args, 'stream_loop', True)
+                cap = VideoStreamer(source, loop=loop, speed_multiplier=speed)
+                cap.start_streaming()
+                using_streamer = True
+                print(f"Using video streamer for file: {source}")
+            except Exception as e:
+                print(f"Error creating video streamer: {e}")
+                print("Falling back to regular video capture...")
+                cap = None
+        
+        # Fallback to regular video capture
+        if cap is None:
+            if source.isdigit():
+                source = int(source)
+            cap = cv2.VideoCapture(source)
+            
+        if not cap.isOpened():
+            print(f"Error: Could not open video source: {source}")
+            return
+        
+        print(f"Starting video gating system on source: {source}")
+        print(f"Save directory: {self.save_dir}")
+        print(f"Motion threshold: {self.args.motion_thresh}")
+        print(f"Scene hist threshold: {self.args.scene_hist}")
+        print(f"Scene SSIM threshold: {self.args.scene_ssim}")
+        print(f"Track max age: {self.args.max_age_seconds}s")
+        
+        # Main processing loop
+        try:
+            while self.running:
+                ret, frame = cap.read()
+                if not ret:
+                    if isinstance(source, str) and source.startswith('rtsp'):
+                        print("RTSP connection lost, attempting reconnect in 2s...")
+                        time.sleep(2)
+                        cap.release()
+                        cap = cv2.VideoCapture(source)
+                        continue
+                    else:
+                        break
+                
+                self.process_frame(frame)
+                
+        except KeyboardInterrupt:
+            self.request_shutdown("Keyboard interrupt (Ctrl+C)")
+        finally:
+            # Perform graceful shutdown if requested
+            if self.shutdown_requested:
+                self.perform_graceful_shutdown()
+            
+            # Release video capture or streamer
+            if using_streamer:
+                cap.stop_streaming()
+                # Show streaming stats
+                stats = cap.get_stats()
+                print(f"\n[STREAMER] Final stats: {stats['frames_streamed']} frames, "
+                      f"{stats['actual_fps']:.1f} FPS avg")
+            cap.release()
+            
+            if self.args.show:
+                cv2.destroyAllWindows()
+            self.llm_sink.shutdown()
+            
+            # Wait for async file saves to complete
+            print("[SHUTDOWN] Waiting for async file saves to complete...")
+            if not self.async_saver.wait_for_completion(timeout=10.0):
+                print("[SHUTDOWN] Warning: Some file saves may not have completed")
+            
+            # Print async save stats
+            save_stats = self.async_saver.get_stats()
+            print(f"[ASYNC_SAVE] Stats: {save_stats['saves_completed']} completed, "
+                  f"{save_stats['saves_failed']} failed, {save_stats['queue_full_drops']} dropped")
+            
+            # Shutdown async saver
+            shutdown_async_saver()
+            
+            # Print performance statistics and save final data
+            self.perf_tracker.print_statistics()
+            self.perf_tracker.save_final_stats()
+            
+            # Print sampling statistics if enabled
+            if self.enable_sampling:
+                stats = self.frame_sampler.get_stats()
+                print(f"\\n[60FPS] Sampling Stats:")
+                print(f"  Frames seen: {stats['frames_seen']}")
+                print(f"  Frames processed: {stats['frames_processed']}")
+                print(f"  Skip rate: {stats['current_skip_rate']}")
+                print(f"  Effective FPS: {stats['effective_fps']:.1f}")
+                print(f"  Processing ratio: {stats['frames_processed']/stats['frames_seen']*100:.1f}%")
+    
+    def request_shutdown(self, reason="User request"):
+        """Request graceful shutdown."""
+        if not self.shutdown_requested:
+            print(f"\n[SHUTDOWN] Graceful shutdown requested: {reason}")
+            print(f"[SHUTDOWN] Finishing pending frame buffer operations...")
+            self.shutdown_requested = True
+            self.shutdown_reason = reason
+    
+    def perform_graceful_shutdown(self):
+        """Perform graceful shutdown, finishing pending operations."""
+        print(f"[SHUTDOWN] Processing {self.frame_buffer.get_pending_count()} pending captures...")
+        
+        # Set a reasonable timeout for pending captures
+        shutdown_timeout = 10.0  # 10 seconds max
+        shutdown_start = time.time()
+        
+        # Continue processing until all buffers are done or timeout
+        while (self.frame_buffer.get_pending_count() > 0 and 
+               time.time() - shutdown_start < shutdown_timeout):
+            
+            # Process any completed captures without new frame input
+            completed_captures = self.frame_buffer.process_frame(None)
+            
+            for capture in completed_captures:
+                best_frame, quality_metrics = capture.get_best_frame()
+                if best_frame is not None:
+                    # Save the best quality frame
+                    path = self.save_buffered_frame(best_frame, capture.event_type, capture.track_id, quality_metrics)
+                    if path:
+                        self.log_event(capture.event_type + "_change" if capture.event_type == "scene" else "object_entered", 
+                                     path, track_id=capture.track_id or "", 
+                                     changed_ratio=getattr(self, 'current_changed_ratio', 0.0))
+                        
+                        # Enqueue to LLM
+                        if not self.args.dry_run:
+                            self.llm_sink.enqueue_to_llm(self.args.prompt, path)
+                else:
+                    print(f"[SHUTDOWN] No good quality frame found for {capture.event_type}")
+            
+            # Small delay to avoid busy waiting
+            if self.frame_buffer.get_pending_count() > 0:
+                time.sleep(0.1)
+        
+        # Clear any remaining old captures
+        remaining = self.frame_buffer.get_pending_count()
+        if remaining > 0:
+            print(f"[SHUTDOWN] Timeout reached, dropping {remaining} pending captures")
+            self.frame_buffer.clear_old_captures()
+        
+        # Wait for LLM queue to finish
+        llm_queue_size = self.llm_sink.get_queue_size()
+        if llm_queue_size > 0:
+            print(f"[SHUTDOWN] Waiting for {llm_queue_size} LLM requests to complete...")
+            self.llm_sink.wait_for_completion(timeout=15)
+        
+        print(f"[SHUTDOWN] Graceful shutdown complete: {self.shutdown_reason}")
+        self.running = False
+    
+    def shutdown(self):
+        """Legacy shutdown method for compatibility."""
+        self.request_shutdown("Legacy shutdown call")
+        self.perform_graceful_shutdown()
+
+
+# Global reference to system for signal handling
+_global_system = None
+
+def signal_handler(sig, frame):
+    signal_name = "SIGINT" if sig == signal.SIGINT else "SIGTERM"
+    print(f"\nReceived {signal_name} signal")
+    
+    if _global_system is not None:
+        _global_system.request_shutdown(f"Signal {signal_name}")
+    else:
+        print("No system instance available, forcing exit...")
+        sys.exit(1)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Real-time video gating system for intelligent frame processing"
+    )
+    
+    parser.add_argument("--source", type=str, default="0",
+                       help="Webcam index, file path, or RTSP URL")
+    parser.add_argument("--stream-video", action="store_true",
+                       help="Stream video file at real-time frame rate (for video files only)")
+    parser.add_argument("--stream-speed", type=float, default=1.0,
+                       help="Video streaming speed multiplier (default: 1.0)")
+    parser.add_argument("--stream-loop", action="store_true", default=True,
+                       help="Loop video when streaming (default: True)")
+    parser.add_argument("--no-stream-loop", action="store_true",
+                       help="Don't loop video when streaming")
+    parser.add_argument("--save-dir", type=str, default="events",
+                       help="Directory to save event frames")
+    parser.add_argument("--prompt", type=str, 
+                       default="fetch all the pictures of humans",
+                       help="User query for AI analysis (e.g., 'find humans', 'check for cigarettes')")
+    parser.add_argument("--openai-api-key", type=str, default=None,
+                       help="OpenAI API key for GPT-4 Vision (uses stub if not provided)")
+    parser.add_argument("--openai-model", type=str, default="gpt-4o",
+                       help="OpenAI model to use (default: gpt-4o)")
+    
+    # Motion gate params
+    parser.add_argument("--motion-thresh", type=float, default=0.02,
+                       help="Motion threshold (fraction of pixels, default 0.02)")
+    
+    # Scene gate params
+    parser.add_argument("--scene-hist", type=float, default=0.50,
+                       help="Scene histogram threshold (default 0.50)")
+    parser.add_argument("--scene-ssim", type=float, default=0.45,
+                       help="Scene SSIM threshold (default 0.45)")
+    
+    # Object detection params
+    parser.add_argument("--confirm-hits", type=int, default=2,
+                       help="Confirm track after K consecutive hits (default 2)")
+    parser.add_argument("--max-age-seconds", type=float, default=60.0,
+                       help="Track max age in seconds since last seen (default 60.0)")
+    parser.add_argument("--imgsz", type=int, default=416,
+                       help="Detector input size (default 416)")
+    parser.add_argument("--conf", type=float, default=0.4,
+                       help="Detector confidence threshold (default 0.4)")
+    parser.add_argument("--iou", type=float, default=0.7,
+                       help="Detector IoU threshold (default 0.7)")
+    parser.add_argument("--min-area-frac", type=float, default=0.01,
+                       help="Ignore boxes smaller than this fraction (default 0.01)")
+    parser.add_argument("--classes", type=str, default=None,
+                       help="Comma-separated list of class IDs to keep (e.g., '0,2,5')")
+    
+    # Image quality control
+    parser.add_argument("--blur-threshold", type=float, default=25.0,
+                       help="Minimum blur score for sharp images (default 25.0)")
+    parser.add_argument("--min-brightness", type=float, default=20.0,
+                       help="Minimum image brightness (default 20.0)")
+    parser.add_argument("--max-brightness", type=float, default=240.0,
+                       help="Maximum image brightness (default 240.0)")
+    parser.add_argument("--min-contrast", type=float, default=10.0,
+                       help="Minimum image contrast (default 10.0)")
+    parser.add_argument("--buffer-frames", type=int, default=10,
+                       help="Number of frames to capture after event detection (default 10)")
+    parser.add_argument("--disable-quality-filter", action="store_true",
+                       help="Disable quality filtering (save best frame regardless of quality)")
+    parser.add_argument("--stop-on-good-frame", action="store_true", default=True,
+                       help="Stop capturing as soon as a good quality frame is found (default: True)")
+    parser.add_argument("--capture-all-frames", action="store_true",
+                       help="Capture all buffer frames and pick the best (opposite of --stop-on-good-frame)")
+    
+    # Display and control
+    parser.add_argument("--show", action="store_true",
+                       help="Show live preview with overlays")
+    parser.add_argument("--dry-run", action="store_true",
+                       help="Do not call LLM, just log/save")
+    parser.add_argument("--llm-workers", type=int, default=4,
+                       help="Number of parallel LLM worker threads (default: 4)")
+    
+    # High FPS optimization
+    parser.add_argument("--enable-60fps-mode", action="store_true",
+                       help="Enable optimizations for 60 FPS processing")
+    parser.add_argument("--target-fps", type=float, default=30.0,
+                       help="Target processing FPS for adaptive sampling (default: 30.0)")
+    parser.add_argument("--min-fps", type=float, default=10.0,
+                       help="Minimum processing FPS (default: 10.0)")
+    parser.add_argument("--max-fps", type=float, default=60.0,
+                       help="Maximum processing FPS (default: 60.0)")
+    parser.add_argument("--bypass-gates", action="store_true",
+                       help="Bypass motion/scene gates, run YOLO on interval only")
+    
+    args = parser.parse_args()
+    
+    # Handle conflicting arguments
+    if args.capture_all_frames:
+        args.stop_on_good_frame = False
+    
+    # Handle stream loop arguments
+    if args.no_stream_loop:
+        args.stream_loop = False
+    
+    # Setup signal handlers
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    # Run system
+    global _global_system
+    system = VideoGatingSystem(args)
+    _global_system = system  # Store global reference for signal handler
+    
+    try:
+        system.run()
+    finally:
+        _global_system = None  # Clear global reference
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,22 @@
+# Core computer vision and ML libraries
+opencv-python>=4.8.0
+numpy>=1.24.0
+
+# YOLO object detection
+ultralytics>=8.0.0
+
+# PyTorch for MPS/GPU support  
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Signal processing for SSIM
+scipy>=1.10.0
+
+# OpenAI API for GPT-4 Vision
+openai>=1.0.0
+
+# Optional: ONNX runtime for faster inference
+# onnxruntime>=1.15.0
+
+# Optional: Pillow for additional image support
+Pillow>=9.5.0

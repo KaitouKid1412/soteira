@@ -1,0 +1,26 @@
+[tool.poetry]
+name = "video-gating-system"
+version = "1.0.0"
+description = "Real-time video gating system for intelligent frame processing with GPT-5"
+authors = ["Your Name <your.email@example.com>"]
+readme = "README.md"
+packages = [{include = "gates"}, {include = "utils"}]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+opencv-python = "*"
+numpy = "*"
+ultralytics = "*"
+torch = "*"
+torchvision = "*"
+scipy = "*"
+Pillow = "*"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "*"
+black = "*"
+flake8 = "*"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
