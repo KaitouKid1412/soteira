@@ -16,6 +16,7 @@ torchvision = ">=0.15.0"
 scipy = "^1.10.0"
 Pillow = "^9.5.0"
 openai = "^1.99.9"
+scikit-learn = "^1.7.1"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^7.4.0"

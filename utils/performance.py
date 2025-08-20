@@ -200,7 +200,7 @@ class FramePerformanceTracker:
         
         print(f"Runtime: {stats['total_runtime_seconds']:.1f}s")
         print(f"Total frames processed: {stats['total_frames']}")
-        print(f"Frames sent to LLM: {stats['frames_sent_to_llm']}")
+        print(f"Images sent to LLM: {stats['frames_sent_to_llm']}")
         print(f"Average FPS: {stats['avg_fps']:.1f}")
         
         print(f"\nFRAME PROCESSING TIMES:")

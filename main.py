@@ -18,6 +18,15 @@ import queue
 import cv2
 import numpy as np
 import torch
+import platform
+
+# macOS OpenCV GUI initialization
+if platform.system() == "Darwin":  # macOS
+    try:
+        # Initialize GUI backend early
+        cv2.startWindowThread()
+    except:
+        pass
 
 from gates.motion import MotionGate
 from gates.scene import SceneGate
@@ -74,7 +83,8 @@ class VideoGatingSystem:
             user_query=args.prompt,
             openai_api_key=args.openai_api_key,
             dry_run=args.dry_run,
-            num_workers=args.llm_workers
+            num_workers=args.llm_workers,
+            similarity_threshold=args.similarity_threshold
         )
         
         # Timing and display
@@ -82,6 +92,19 @@ class VideoGatingSystem:
         self.frame_count = 0  # Frames actually processed
         self._total_frames_seen = 0  # Total frames from video (including dropped)
         self.running = True
+        
+        # Async display system
+        self.display_frame = None
+        self.display_lock = threading.Lock()
+        self.display_thread = None
+        # Display control: enabled by default, unless --no-display is used
+        if getattr(args, 'no_display', False):
+            self.enable_async_display = False
+        else:
+            self.enable_async_display = True
+        
+        # Thread-safe logging
+        self.log_lock = threading.Lock()
         
         # Frame buffer for quality capture
         self.frame_buffer = FrameBuffer(max_pending=10, capture_timeout=3.0)
@@ -118,6 +141,11 @@ class VideoGatingSystem:
         if not classes_str:
             return None
         return [int(x.strip()) for x in classes_str.split(',')]
+    
+    def safe_print(self, message):
+        """Thread-safe print function to fix log spacing issues."""
+        with self.log_lock:
+            print(message)
     
     def init_csv_log(self):
         with open(self.csv_path, 'w', newline='') as f:
@@ -231,19 +259,37 @@ class VideoGatingSystem:
             dropped_count = self._total_frames_seen - self.frame_count
             if dropped_count % 30 == 0:  # Log every 30th drop to avoid spam
                 print(f"[FRAME DROP] Total dropped: {dropped_count}, Reason: {drop_reason}")
+            
+            # Still update display even for dropped frames (for smooth preview)
+            if self.enable_async_display:
+                display_frame = frame.copy()
+                # Draw minimal overlay for dropped frames
+                cv2.putText(display_frame, "FRAME DROPPED", (10, 30), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                cv2.putText(display_frame, f"FPS: {self.fps_counter.get_fps():.1f}", (10, 60), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                self.update_display_frame(display_frame)
             return  # Skip this frame
         
         frame_start_time = time.time()
-        
-        # Detailed timing breakdown for bottleneck analysis
-        timing_breakdown = {}
-        last_time = frame_start_time
         
         # Resize frame - use smaller size for 60fps mode
         if self.enable_sampling:
             frame_small = cv2.resize(frame, (480, 270))  # Smaller for speed
         else:
             frame_small = cv2.resize(frame, (640, 360))
+        
+        # ALWAYS update display first (regardless of motion detection)
+        if self.enable_async_display:
+            display_frame = frame.copy()
+            # We'll add overlays after processing, but show frame immediately for responsiveness
+            self.update_display_frame(display_frame)
+            if self.frame_count == 1:
+                print("[DEBUG] First frame sent to display immediately")
+        
+        # Detailed timing breakdown for bottleneck analysis
+        timing_breakdown = {}
+        last_time = frame_start_time
         
         current_time = time.time()
         timing_breakdown['resize'] = (current_time - last_time) * 1000
@@ -268,13 +314,12 @@ class VideoGatingSystem:
                                  path, track_id=capture.track_id or "", 
                                  changed_ratio=self.current_changed_ratio)
                     
-                    # Enqueue to LLM
-                    llm_queued = False
-                    if not self.args.dry_run:
-                        llm_queued = self.llm_sink.enqueue_to_llm(self.args.prompt, path)
+                    # Enqueue to LLM (dry-run is handled inside LLM sink)
+                    # Pass frame data to avoid race condition with async file saving
+                    llm_queued = self.llm_sink.enqueue_to_llm(self.args.prompt, path, best_frame)
                     
-                    # Record LLM event
-                    self.perf_tracker.record_llm_event(llm_queued or self.args.dry_run, self.llm_sink.get_queue_size())
+                    # Record LLM event (only count as sent if actually queued)
+                    self.perf_tracker.record_llm_event(llm_queued, self.llm_sink.get_queue_size())
                     
                     # Flash event
                     if capture.event_type == "scene":
@@ -288,55 +333,69 @@ class VideoGatingSystem:
         # Store current changed ratio for logging
         self.current_changed_ratio = 0.0
         
-        if getattr(self.args, 'bypass_gates', False):
-            # Bypass mode: skip motion/scene detection entirely
-            changed_ratio = 0.0
-            d_hist, ssim = 0.0, 1.0
-            motion_spike = False
-            scene_changed = False
+        # Gate controls - check individual skip flags or global bypass
+        skip_motion = getattr(self.args, 'skip_motion', False) or getattr(self.args, 'bypass_gates', False)
+        skip_scene = getattr(self.args, 'skip_scene', False) or getattr(self.args, 'bypass_gates', False) 
+        
+        # Gate 1: Motion detection (or skip if requested)
+        if skip_motion:
+            changed_ratio = 1.0  # Force motion spike
+            motion_spike = True
+            print(f"[SKIP] Motion gate bypassed - processing frame {self.frame_count}")
         else:
-            # Gate 1: Motion (every frame)
             with self.perf_tracker.time_gate('motion'):
                 changed_ratio, motion_mask = self.motion_gate.apply_motion(frame_small)
                 motion_spike = changed_ratio > self.args.motion_thresh
-            
-            self.current_changed_ratio = changed_ratio
-            self.perf_tracker.record_motion_result(motion_spike)
-            
-            # Gate 2: Scene change (only on motion spikes)
-            d_hist, ssim = 0.0, 1.0
-            scene_changed = False
-            
+        
+        self.current_changed_ratio = changed_ratio
+        self.perf_tracker.record_motion_result(motion_spike)
+        
+        # Gate 2: Scene change detection (or skip if requested)
+        d_hist, ssim = 0.0, 1.0
+        scene_changed = False
+        
+        if skip_scene:
+            if motion_spike:  # Only if motion was detected (or motion was skipped)
+                scene_changed = True
+                d_hist, ssim = 1.0, 0.0  # Force scene change values
+                print(f"[SKIP] Scene gate bypassed - processing frame {self.frame_count}")
+        else:
             if motion_spike:
                 with self.perf_tracker.time_gate('scene'):
                     scene_changed, d_hist, ssim = self.scene_gate.check_scene_change(frame_small)
-            
-            self.perf_tracker.record_scene_result(scene_changed)
-            
-            if scene_changed:
-                # Request buffered capture instead of immediate save
-                self.frame_buffer.request_capture(
-                    "scene", 
-                    frames_to_capture=self.args.buffer_frames,
-                    blur_threshold=self.args.blur_threshold,
-                    min_brightness=self.args.min_brightness,
-                    max_brightness=self.args.max_brightness,
-                    min_contrast=self.args.min_contrast,
-                    disable_quality_filter=self.args.disable_quality_filter,
-                    stop_on_good_frame=self.args.stop_on_good_frame
-                )
         
-        # Gate 3: Object detection (only on motion spikes + scene changes)
+        self.perf_tracker.record_scene_result(scene_changed)
+        
+        if scene_changed:
+            # Request buffered capture instead of immediate save
+            self.frame_buffer.request_capture(
+                "scene", 
+                frames_to_capture=self.args.buffer_frames,
+                blur_threshold=self.args.blur_threshold,
+                min_brightness=self.args.min_brightness,
+                max_brightness=self.args.max_brightness,
+                min_contrast=self.args.min_contrast,
+                disable_quality_filter=self.args.disable_quality_filter,
+                stop_on_good_frame=self.args.stop_on_good_frame
+            )
+        
+        # Gate 3: Object detection (or skip if requested)
         detections = []
         new_tracks = []
-        should_detect = (
-            motion_spike or
-            scene_changed
-        )
+        skip_object = getattr(self.args, 'skip_object', False) or getattr(self.args, 'bypass_gates', False)
         
-        if should_detect:
-            with self.perf_tracker.time_gate('object'):
-                detections, new_tracks = self.object_gate.process_frame(frame_small, frame)
+        if skip_object:
+            # Skip object detection entirely - no new tracks will be created
+            print(f"[SKIP] Object gate bypassed - no object detection for frame {self.frame_count}")
+        else:
+            should_detect = (
+                motion_spike or
+                scene_changed
+            )
+            
+            if should_detect:
+                with self.perf_tracker.time_gate('object'):
+                    detections, new_tracks = self.object_gate.process_frame(frame_small, frame)
         
         self.perf_tracker.record_object_result(len(detections))
         
@@ -357,16 +416,12 @@ class VideoGatingSystem:
                 stop_on_good_frame=self.args.stop_on_good_frame
             )
         
-        # Display (optimized for high FPS)
-        if self.args.show:
+        # Update display with overlays (frame was already sent above for immediate response)
+        if self.enable_async_display:
+            # Create display frame with full overlays
             display_frame = frame.copy()
             self.draw_overlays(display_frame, changed_ratio, d_hist, ssim, detections)
-            cv2.imshow("Video Gating System", display_frame)
-            
-            # Non-blocking key check - important for maintaining video timing
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q') or key == 27:  # 'q' or ESC
-                self.request_shutdown("User pressed 'q' or ESC")
+            self.update_display_frame(display_frame)
         
         # Check if graceful shutdown was requested
         if self.shutdown_requested:
@@ -410,6 +465,134 @@ class VideoGatingSystem:
         # End performance tracking for this frame
         self.perf_tracker.end_frame()
     
+    def start_display_thread(self):
+        """Start the async display thread for real-time preview."""
+        if not self.enable_async_display:
+            return
+            
+        self.display_thread = threading.Thread(target=self._display_loop, daemon=True)
+        self.display_thread.start()
+        print("[DISPLAY] Started async display thread for real-time preview")
+    
+    def _display_loop(self):
+        """Background thread for smooth video display."""
+        import cv2
+        import os
+        import platform
+        print("[DISPLAY] Display thread started")
+        
+        # macOS-specific fixes for OpenCV GUI
+        if platform.system() == "Darwin":  # macOS
+            try:
+                # Try to set the GUI backend explicitly
+                os.environ['OPENCV_VIDEOIO_PRIORITY_MSMF'] = '0'  
+                # Force Qt backend if available
+                try:
+                    cv2.setUseOptimized(True)
+                except:
+                    pass
+            except Exception as e:
+                print(f"[DISPLAY] Warning: Could not set macOS OpenCV optimizations: {e}")
+        
+        # Initialize display window
+        window_name = "Video Gating System - Real Time"
+        window_created = False
+        
+        frame_count = 0
+        frames_received = 0
+        while self.running:  # Removed safety limit
+            try:
+                # Get latest frame (thread-safe)
+                with self.display_lock:
+                    frame_to_show = self.display_frame.copy() if self.display_frame is not None else None
+                
+                if frame_to_show is not None:
+                    frames_received += 1
+                    if frames_received == 1:
+                        print("[DEBUG] Display thread received first frame")
+                    elif frames_received % 30 == 0:
+                        print(f"[DEBUG] Display thread received {frames_received} frames")
+                    # Create window on first frame with macOS workarounds
+                    if not window_created:
+                        window_creation_success = False
+                        
+                        # Try multiple approaches for macOS compatibility
+                        window_flags = [
+                            cv2.WINDOW_NORMAL,
+                            cv2.WINDOW_AUTOSIZE,
+                            cv2.WINDOW_KEEPRATIO | cv2.WINDOW_GUI_NORMAL
+                        ]
+                        
+                        for i, flag in enumerate(window_flags):
+                            try:
+                                print(f"[DISPLAY] Attempting window creation method {i+1}...")
+                                cv2.namedWindow(window_name, flag)
+                                
+                                # Only resize for WINDOW_NORMAL
+                                if flag == cv2.WINDOW_NORMAL:
+                                    cv2.resizeWindow(window_name, 800, 600)
+                                
+                                # Test if window was actually created by trying to move it
+                                cv2.moveWindow(window_name, 100, 100)
+                                window_created = True
+                                window_creation_success = True
+                                print(f"[DISPLAY] Window created successfully using method {i+1}")
+                                break
+                                
+                            except Exception as e:
+                                print(f"[DISPLAY] Window creation method {i+1} failed: {e}")
+                                # Try to destroy any partial window
+                                try:
+                                    cv2.destroyWindow(window_name)
+                                except:
+                                    pass
+                        
+                        if not window_creation_success:
+                            print("[DISPLAY] All window creation methods failed. OpenCV GUI not available.")
+                            print("[DISPLAY] This is common when running from Terminal on macOS.")
+                            print("[DISPLAY] Try running from an IDE or with DISPLAY set.")
+                            return
+                    
+                    try:
+                        cv2.imshow(window_name, frame_to_show)
+                        frame_count += 1
+                    except Exception as e:
+                        print(f"[DISPLAY] Failed to show frame: {e}")
+                        break
+                
+                # Check for quit key (non-blocking)
+                try:
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == ord('q') or key == 27:  # 'q' or ESC
+                        print("[DISPLAY] User requested quit")
+                        self.running = False
+                        break
+                except Exception as e:
+                    print(f"[DISPLAY] waitKey error: {e}")
+                    break
+                    
+                # Display at ~30 FPS
+                time.sleep(0.033)
+                
+            except Exception as e:
+                print(f"[DISPLAY] Error in display loop: {e}")
+                break
+        
+        # Cleanup
+        try:
+            cv2.destroyAllWindows()
+        except:
+            pass
+        print(f"[DISPLAY] Display thread stopped after {frame_count} frames")
+    
+    def update_display_frame(self, frame):
+        """Update the frame for async display (thread-safe)."""
+        if not self.enable_async_display:
+            return
+            
+        with self.display_lock:
+            self.display_frame = frame.copy()
+    
     def run(self):
         # Setup video capture or streamer
         source = self.args.source
@@ -448,6 +631,15 @@ class VideoGatingSystem:
         print(f"Scene SSIM threshold: {self.args.scene_ssim}")
         print(f"Track max age: {self.args.max_age_seconds}s")
         
+        print(f"Async display enabled: {self.enable_async_display}")
+        
+        # Start async display thread for real-time preview (only if enabled)
+        if self.enable_async_display:
+            print("Starting display thread...")
+            self.start_display_thread()
+        else:
+            print("Display thread not started (async display disabled)")
+        
         # Main processing loop
         try:
             while self.running:
@@ -460,9 +652,22 @@ class VideoGatingSystem:
                         cap = cv2.VideoCapture(source)
                         continue
                     else:
+                        print("End of video or read error")
                         break
                 
+                # Check if shutdown was requested before processing
+                if not self.running:
+                    print("Shutdown requested, stopping main loop")
+                    break
+                    
                 self.process_frame(frame)
+                
+                # Check again after processing
+                if not self.running:
+                    print("Shutdown requested after frame processing")
+                    break
+                
+                # Removed safety frame limit for full testing
                 
         except KeyboardInterrupt:
             self.request_shutdown("Keyboard interrupt (Ctrl+C)")
@@ -480,7 +685,7 @@ class VideoGatingSystem:
                       f"{stats['actual_fps']:.1f} FPS avg")
             cap.release()
             
-            if self.args.show:
+            if self.enable_async_display:
                 cv2.destroyAllWindows()
             self.llm_sink.shutdown()
             
@@ -544,9 +749,8 @@ class VideoGatingSystem:
                                      path, track_id=capture.track_id or "", 
                                      changed_ratio=getattr(self, 'current_changed_ratio', 0.0))
                         
-                        # Enqueue to LLM
-                        if not self.args.dry_run:
-                            self.llm_sink.enqueue_to_llm(self.args.prompt, path)
+                        # Enqueue to LLM (dry-run is handled inside LLM sink)
+                        self.llm_sink.enqueue_to_llm(self.args.prompt, path, best_frame)
                 else:
                     print(f"[SHUTDOWN] No good quality frame found for {capture.event_type}")
             
@@ -579,14 +783,9 @@ class VideoGatingSystem:
 _global_system = None
 
 def signal_handler(sig, frame):
-    signal_name = "SIGINT" if sig == signal.SIGINT else "SIGTERM"
-    print(f"\nReceived {signal_name} signal")
-    
-    if _global_system is not None:
-        _global_system.request_shutdown(f"Signal {signal_name}")
-    else:
-        print("No system instance available, forcing exit...")
-        sys.exit(1)
+    print(f"\nCtrl+C pressed - forcing exit...")
+    import os
+    os._exit(0)
 
 
 def main():
@@ -659,12 +858,16 @@ def main():
                        help="Capture all buffer frames and pick the best (opposite of --stop-on-good-frame)")
     
     # Display and control
-    parser.add_argument("--show", action="store_true",
-                       help="Show live preview with overlays")
+    parser.add_argument("--realtime-display", action="store_true",
+                       help="Force enable real-time async display (enabled by default)")
+    parser.add_argument("--no-display", action="store_true",
+                       help="Disable real-time display completely")
     parser.add_argument("--dry-run", action="store_true",
                        help="Do not call LLM, just log/save")
     parser.add_argument("--llm-workers", type=int, default=4,
                        help="Number of parallel LLM worker threads (default: 4)")
+    parser.add_argument("--similarity-threshold", type=float, default=0.90,
+                       help="Image similarity threshold for deduplication (0.9 = 90% similar = skip)")
     
     # High FPS optimization
     parser.add_argument("--enable-60fps-mode", action="store_true",
@@ -676,7 +879,13 @@ def main():
     parser.add_argument("--max-fps", type=float, default=60.0,
                        help="Maximum processing FPS (default: 60.0)")
     parser.add_argument("--bypass-gates", action="store_true",
-                       help="Bypass motion/scene gates, run YOLO on interval only")
+                       help="Bypass all gates (motion/scene/object) - process every frame")
+    parser.add_argument("--skip-motion", action="store_true", 
+                       help="Skip motion detection gate - process all frames for scene/object detection")
+    parser.add_argument("--skip-scene", action="store_true",
+                       help="Skip scene change detection gate - run object detection without scene requirement") 
+    parser.add_argument("--skip-object", action="store_true",
+                       help="Skip object detection gate - only save scene change frames")
     
     args = parser.parse_args()
     

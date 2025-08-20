@@ -12,8 +12,53 @@ from datetime import datetime
 from pathlib import Path
 import openai
 from typing import Optional
+import cv2
+import numpy as np
 
 from utils.prompt_transformer import LLMPromptTransformer, SimplePromptTransformer
+
+
+def extract_image_features_fast(image_source) -> np.ndarray:
+    """
+    Fast feature extraction using simple pixel downsampling.
+    
+    Args:
+        image_source: Either path to image file (str) or numpy array (cv2 image)
+        
+    Returns:
+        Feature vector as numpy array (small and fast)
+    """
+    try:
+        # Load image from path or use provided array
+        if isinstance(image_source, str):
+            img = cv2.imread(image_source)
+            if img is None:
+                return np.zeros(64)  # Much smaller fallback
+        else:
+            # Assume it's already a cv2 image array
+            img = image_source
+            if img is None or img.size == 0:
+                return np.zeros(64)
+        
+        # Super small resize for speed (8x8 = 64 pixels)
+        img_tiny = cv2.resize(img, (8, 8))
+        
+        # Convert to grayscale for speed
+        img_gray = cv2.cvtColor(img_tiny, cv2.COLOR_BGR2GRAY)
+        
+        # Flatten to feature vector
+        features = img_gray.flatten().astype(np.float32)
+        
+        # Proper L2 normalization for cosine similarity
+        features = features / 255.0  # Scale to [0,1]
+        norm = np.linalg.norm(features)
+        if norm > 0:
+            features = features / norm  # L2 normalize to unit length
+        
+        return features
+        
+    except Exception as e:
+        return np.zeros(64)
 
 
 def encode_image_to_base64(image_path: str) -> str:
@@ -154,7 +199,8 @@ class LLMSink:
     """Background processor for LLM API calls with parallel processing and rate limit handling."""
     
     def __init__(self, user_query: str, openai_api_key: Optional[str] = None, 
-                 dry_run: bool = False, max_queue_size: int = 100, num_workers: int = 4):
+                 dry_run: bool = False, max_queue_size: int = 100, num_workers: int = 4,
+                 similarity_threshold: float = 0.90):
         """
         Initialize LLM sink.
         
@@ -164,11 +210,22 @@ class LLMSink:
             dry_run: If True, don't actually call LLM (just log)
             max_queue_size: Maximum number of queued requests
             num_workers: Number of parallel worker threads
+            similarity_threshold: Cosine similarity threshold (0.9 = 90% similar = skip)
         """
         self.user_query = user_query
         self.openai_api_key = openai_api_key
         self.dry_run = dry_run
         self.max_queue_size = max_queue_size
+        self.similarity_threshold = similarity_threshold
+        
+        # Image similarity tracking - maintain history of sent images
+        self.sent_image_features = []  # List of all sent image features
+        self.max_history_size = 100    # Keep last 100 sent images for comparison
+        self.similarity_stats = {
+            'total_requested': 0,
+            'skipped_similar': 0,
+            'sent_to_llm': 0
+        }
         self.num_workers = num_workers
         
         # Initialize prompt transformer
@@ -209,6 +266,10 @@ class LLMSink:
         # Create analysis directory
         self.analysis_dir = Path("events") / "llm_analysis"
         self.analysis_dir.mkdir(exist_ok=True)
+        
+        # Create directory for tracking LLM-sent images
+        self.llm_sent_dir = Path("events") / "llm_sent"
+        self.llm_sent_dir.mkdir(exist_ok=True)
         
         # Start worker thread
         self.start()
@@ -261,6 +322,13 @@ class LLMSink:
                         print(f"[LLM-{worker_id}] DRY RUN - Would analyze image:")
                         print(f"  Image: {image_path}")
                         print(f"  With prompt: {self.image_prompt[:100]}...")
+                        
+                        # Show running total for dry run
+                        total = self.similarity_stats['total_requested']
+                        sent = self.similarity_stats['sent_to_llm'] 
+                        skipped = self.similarity_stats['skipped_similar']
+                        print(f"  [DRY-RUN TOTAL] Would send {sent} images to LLM (filtered {skipped}/{total} similar)")
+                        
                         response = send_to_gpt_stub(self.image_prompt, image_path)
                     else:
                         # Use real API or stub based on setup
@@ -406,20 +474,110 @@ class LLMSink:
         except Exception as e:
             print(f"[LLM] Error saving analysis: {e}")
     
-    def enqueue_to_llm(self, prompt, image_path):
+    def _log_sent_image(self, image_path: str, frame_data=None):
         """
-        Enqueue an LLM request for background processing.
+        Log and optionally save copy of image that was sent to LLM.
+        
+        Args:
+            image_path: Original image path
+            frame_data: Optional frame data (cv2 image array)
+        """
+        try:
+            # Create a copy in the llm_sent directory with timestamp and sequence number
+            original_name = Path(image_path).stem
+            timestamp = int(time.time() * 1000)
+            sent_filename = f"{original_name}_sent_{self.similarity_stats['sent_to_llm']:03d}_{timestamp}.jpg"
+            sent_path = self.llm_sent_dir / sent_filename
+            
+            # Save the image copy
+            if frame_data is not None:
+                # Use the frame data directly (more reliable)
+                import cv2
+                cv2.imwrite(str(sent_path), frame_data)
+                print(f"[LLM] 📁 Saved LLM copy: {sent_path.name}")
+            else:
+                # Fall back to copying the original file
+                import shutil
+                if Path(image_path).exists():
+                    shutil.copy2(image_path, sent_path)
+                    print(f"[LLM] 📁 Copied LLM image: {sent_path.name}")
+                else:
+                    print(f"[LLM] ⚠️  Could not copy LLM image: {image_path} (file not found)")
+                    
+        except Exception as e:
+            print(f"[LLM] Error logging sent image: {e}")
+    
+    def enqueue_to_llm(self, prompt, image_path, frame_data=None):
+        """
+        Enqueue an LLM request for background processing with similarity deduplication.
         
         Args:
             prompt: Text prompt to send
             image_path: Path to image file
+            frame_data: Optional cv2 image array (to avoid race condition with file I/O)
             
         Returns:
-            bool: True if successfully queued, False if queue is full
+            bool: True if successfully queued, False if queue is full or image too similar
         """
+        self.similarity_stats['total_requested'] += 1
+        
+        # DEBUG: Always print first few calls
+        if self.similarity_stats['total_requested'] <= 5:
+            print(f"[DEBUG] enqueue_to_llm called #{self.similarity_stats['total_requested']}: {image_path}")
+        
+        # Extract features from new image (use frame_data if available to avoid race condition)
+        image_source = frame_data if frame_data is not None else image_path
+        new_features = extract_image_features_fast(image_source)
+        
+        # DEBUG: Check if features are valid
+        if self.similarity_stats['total_requested'] <= 3:
+            print(f"[DEBUG] Features extracted: shape={new_features.shape}, min={new_features.min():.3f}, max={new_features.max():.3f}, norm={np.linalg.norm(new_features):.3f}")
+        
+        # Check similarity against ALL previously sent images
+        if len(self.sent_image_features) > 0:
+            # DEBUG: Always print for first few comparisons
+            if self.similarity_stats['total_requested'] <= 5:
+                print(f"[DEBUG] Comparing against {len(self.sent_image_features)} previous images")
+            
+            # Calculate similarities to all previous images (vectorized for speed)
+            similarities = [np.dot(new_features, prev_features) for prev_features in self.sent_image_features]
+            max_similarity = max(similarities)
+            
+            # DEBUG: Always show first few similarity checks
+            if self.similarity_stats['total_requested'] <= 10:
+                print(f"[DEBUG] #{self.similarity_stats['total_requested']} Max similarity: {max_similarity:.4f}, threshold: {self.similarity_threshold}")
+                if len(similarities) >= 3:
+                    print(f"[DEBUG] Top 3 similarities: {sorted(similarities, reverse=True)[:3]}")
+            
+            if max_similarity > self.similarity_threshold:
+                self.similarity_stats['skipped_similar'] += 1
+                similar_idx = similarities.index(max_similarity)
+                print(f"[LLM] SKIPPED: Image too similar ({max_similarity:.3f} > {self.similarity_threshold}) to image #{similar_idx+1} - {image_path}")
+                return False
+        else:
+            # DEBUG: First image
+            if self.similarity_stats['total_requested'] == 1:
+                print(f"[DEBUG] First image - no previous images to compare against")
+        
         try:
-            # Non-blocking queue put
+            # Image is unique enough, queue for LLM processing
             self.request_queue.put((prompt, image_path), block=False)
+            
+            # Add to sent image history (maintain sliding window)
+            self.sent_image_features.append(new_features)
+            
+            # Keep only the most recent images (to prevent memory issues)
+            if len(self.sent_image_features) > self.max_history_size:
+                self.sent_image_features.pop(0)  # Remove oldest
+            
+            self.similarity_stats['sent_to_llm'] += 1
+            
+            print(f"[LLM] QUEUED: Image accepted for processing ({self.similarity_stats['sent_to_llm']}/{self.similarity_stats['total_requested']} sent)")
+            print(f"[LLM] ✓ SENDING TO LLM: {image_path}")
+            
+            # Optional: Save copy of LLM-sent images to separate directory for review
+            self._log_sent_image(image_path, frame_data)
+            
             return True
             
         except queue.Full:
@@ -431,8 +589,12 @@ class LLMSink:
         return self.request_queue.qsize()
     
     def get_stats(self):
-        """Get processing statistics."""
+        """Get processing statistics including similarity deduplication."""
         elapsed = time.time() - self.start_time
+        total_requested = self.similarity_stats['total_requested']
+        skipped_similar = self.similarity_stats['skipped_similar']
+        efficiency_percent = (skipped_similar / total_requested * 100) if total_requested > 0 else 0
+        
         return {
             "processed": self.requests_processed,
             "failed": self.requests_failed,
@@ -440,7 +602,14 @@ class LLMSink:
             "queue_size": self.get_queue_size(),
             "elapsed_seconds": elapsed,
             "rate_per_minute": (self.requests_processed / elapsed * 60) if elapsed > 0 else 0,
-            "active_workers": self.num_workers
+            "active_workers": self.num_workers,
+            "similarity_dedup": {
+                "total_requested": total_requested,
+                "skipped_similar": skipped_similar,
+                "sent_to_llm": self.similarity_stats['sent_to_llm'],
+                "efficiency_percent": efficiency_percent,
+                "threshold": self.similarity_threshold
+            }
         }
     
     def wait_for_completion(self, timeout=30):
@@ -497,9 +666,12 @@ class LLMSink:
         
         # Print final statistics
         stats = self.get_stats()
+        dedup_stats = stats['similarity_dedup']
         print(f"[LLM] Final stats: {stats['processed']} processed, "
               f"{stats['failed']} failed, "
               f"{stats.get('rate_limited', 0)} rate limited, "
               f"{stats['rate_per_minute']:.1f} req/min")
+        print(f"[LLM] Similarity dedup: {dedup_stats['skipped_similar']}/{dedup_stats['total_requested']} "
+              f"({dedup_stats['efficiency_percent']:.1f}%) skipped as duplicates (checked against {len(self.sent_image_features)} unique images)")
         
         print("[LLM] Shutdown complete")
