@@ -214,7 +214,8 @@ class LLMSink:
     
     def __init__(self, user_query: str, openai_api_key: Optional[str] = None, 
                  dry_run: bool = False, max_queue_size: int = 100, num_workers: int = 4,
-                 similarity_threshold: float = 0.90, debug_mode: bool = False):
+                 similarity_threshold: float = 0.90, debug_mode: bool = False,
+                 mode: str = "summary"):
         """
         Initialize LLM sink.
         
@@ -226,6 +227,7 @@ class LLMSink:
             num_workers: Number of parallel worker threads
             similarity_threshold: Cosine similarity threshold (0.9 = 90% similar = skip)
             debug_mode: Enable verbose debug logging
+            mode: Processing mode ('summary' or 'alert')
         """
         self.user_query = user_query
         self.openai_api_key = openai_api_key
@@ -233,6 +235,14 @@ class LLMSink:
         self.max_queue_size = max_queue_size
         self.similarity_threshold = similarity_threshold
         self.debug_mode = debug_mode
+        self.mode = mode
+        
+        # Response collection for summary mode
+        self.collected_responses = []  # List of (timestamp, image_path, response_content)
+        self.response_lock = threading.Lock()  # Thread-safe access to responses
+        
+        # Alert tracking
+        self.alert_count = 0
         
         # Image similarity tracking - maintain history of sent images
         self.sent_image_features = []  # List of all sent image features
@@ -252,8 +262,8 @@ class LLMSink:
             self.prompt_transformer = SimplePromptTransformer()
             self.use_real_api = False
         
-        # Transform the user query once
-        self.transformation = self.prompt_transformer.transform_prompt(user_query)
+        # Transform the user query once with mode
+        self.transformation = self.prompt_transformer.transform_prompt(user_query, mode)
         self.image_prompt = self.transformation["image_prompt"]
         
         print(f"[LLM] User query: '{user_query}'")
@@ -372,6 +382,9 @@ class LLMSink:
                     if self.use_real_api and self.openai_api_key and not self.dry_run:
                         self._update_cost_tracking(response)
                     
+                    # Process response based on mode
+                    self._process_response(image_path, response)
+                    
                     # Save response and analysis
                     self._save_analysis(image_path, response)
                     self.requests_processed += 1
@@ -459,6 +472,180 @@ class LLMSink:
         # Should never reach here
         raise Exception("Unexpected end of retry loop")
     
+    def generate_synthesis_summary(self) -> str:
+        """
+        Generate a comprehensive answer to the user's original question by synthesizing all LLM responses.
+        
+        Returns:
+            str: LLM-synthesized answer to the original user question
+        """
+        if self.mode != "summary":
+            return f"Summary not available in {self.mode} mode"
+        
+        if not self.collected_responses:
+            return "No responses collected for summary"
+            
+        try:
+            # Sort responses by timestamp
+            sorted_responses = sorted(self.collected_responses, key=lambda x: x['timestamp'])
+            
+            if self.debug_mode:
+                print(f"[SYNTHESIS] Processing {len(sorted_responses)} responses to answer: '{self.user_query}'")
+            
+            # Prepare data for synthesis
+            response_texts = []
+            for i, item in enumerate(sorted_responses):
+                response = item['response']
+                raw_content = item.get('raw_content', '')
+                
+                if self.debug_mode:
+                    print(f"[SYNTHESIS DEBUG] Frame {i+1} response type: {type(response)}")
+                    print(f"[SYNTHESIS DEBUG] Frame {i+1} response keys: {list(response.keys()) if isinstance(response, dict) else 'N/A'}")
+                
+                # Convert response to readable text
+                if isinstance(response, dict) and response:
+                    # Extract meaningful fields
+                    response_parts = []
+                    
+                    # Add action/activity info
+                    if 'action' in response:
+                        response_parts.append(f"Action: {response['action']}")
+                    if 'detailed_description' in response:
+                        response_parts.append(f"Description: {response['detailed_description']}")
+                    if 'analysis' in response:
+                        response_parts.append(f"Analysis: {response['analysis']}")
+                    
+                    # Add object info
+                    if 'objects_used' in response and response['objects_used']:
+                        response_parts.append(f"Objects: {response['objects_used']}")
+                    if 'people_count' in response:
+                        response_parts.append(f"People: {response['people_count']}")
+                    
+                    # If no structured fields, add all non-metadata fields
+                    if not response_parts:
+                        for key, value in response.items():
+                            if key not in ['confidence', 'raw_response', 'alert'] and value:
+                                response_parts.append(f"{key}: {value}")
+                    
+                    if response_parts:
+                        response_texts.append(" | ".join(response_parts))
+                    else:
+                        response_texts.append(f"Raw response: {raw_content[:200]}...")
+                        
+                elif raw_content:
+                    # Use raw content if structured response failed
+                    response_texts.append(f"Analysis: {raw_content[:300]}...")
+                else:
+                    response_texts.append("No clear response data")
+            
+            if self.debug_mode:
+                print(f"[SYNTHESIS DEBUG] Prepared {len(response_texts)} response summaries")
+                for i, text in enumerate(response_texts[:3]):  # Show first 3
+                    print(f"[SYNTHESIS DEBUG] Sample {i+1}: {text[:100]}...")
+            
+            # Check if we have meaningful data
+            meaningful_responses = [text for text in response_texts if text and "No clear response data" not in text]
+            if not meaningful_responses:
+                return "No meaningful frame analysis data available for synthesis"
+            
+            # Create synthesis prompt
+            frame_analyses = chr(10).join([f"Frame {i+1}: {text}" for i, text in enumerate(response_texts) if text and "No clear response data" not in text])
+            
+            synthesis_prompt = f"""You are analyzing video content. A user asked: "{self.user_query}"
+
+You have analyzed {len(meaningful_responses)} individual frames from the video. Here are the frame-by-frame observations:
+
+{frame_analyses}
+
+Based on these individual frame analyses, provide a comprehensive answer to the user's original question: "{self.user_query}"
+
+Focus on:
+1. The main activities/actions observed
+2. Patterns and sequences over time  
+3. Overall behavior and context
+4. Direct answer to what the user asked
+
+Respond in a natural, conversational way as if answering the user directly."""
+
+            if self.debug_mode:
+                print(f"[SYNTHESIS DEBUG] Created prompt with {len(meaningful_responses)} meaningful responses")
+                print(f"[SYNTHESIS DEBUG] Prompt preview: {synthesis_prompt[:300]}...")
+
+            # Call LLM for synthesis (if available)
+            if self.use_real_api and self.openai_api_key and not self.dry_run:
+                try:
+                    client = openai.OpenAI(api_key=self.openai_api_key)
+                    response = client.chat.completions.create(
+                        model="gpt-4",  # Use GPT-4 for better synthesis
+                        messages=[
+                            {"role": "system", "content": "You are a helpful video analysis assistant that synthesizes multiple frame observations into coherent answers."},
+                            {"role": "user", "content": synthesis_prompt}
+                        ],
+                        max_tokens=500,
+                        temperature=0.1
+                    )
+                    
+                    synthesis_answer = response.choices[0].message.content.strip()
+                    
+                    # Format the final answer
+                    final_answer = f"""ANSWER TO: "{self.user_query}"
+{'='*60}
+{synthesis_answer}
+
+[Analysis based on {len(sorted_responses)} frames over {self._get_timespan_string(sorted_responses)}]
+{'='*60}"""
+                    
+                    return final_answer
+                    
+                except Exception as e:
+                    print(f"[SYNTHESIS] Error calling LLM for synthesis: {e}")
+                    return self._fallback_synthesis(sorted_responses)
+            else:
+                return self._fallback_synthesis(sorted_responses)
+                
+        except Exception as e:
+            return f"Error generating synthesis: {e}"
+    
+    def _fallback_synthesis(self, sorted_responses) -> str:
+        """Fallback synthesis without LLM."""
+        activities = []
+        descriptions = []
+        
+        for item in sorted_responses:
+            response = item['response']
+            if isinstance(response, dict):
+                if 'action' in response:
+                    activities.append(response['action'])
+                if 'detailed_description' in response:
+                    descriptions.append(response['detailed_description'])
+        
+        # Create basic synthesis
+        unique_activities = list(set(activities))
+        
+        fallback_answer = f"""ANSWER TO: "{self.user_query}"
+{'='*60}
+Based on analysis of {len(sorted_responses)} frames, the main activities observed were:
+
+{chr(10).join([f"• {activity}" for activity in unique_activities[:10]])}
+
+The user appears to be engaged in {', '.join(unique_activities[:3]) if unique_activities else 'various activities'}.
+
+[Basic analysis - LLM synthesis not available]
+{'='*60}"""
+        
+        return fallback_answer
+    
+    def _get_timespan_string(self, sorted_responses) -> str:
+        """Get formatted timespan string."""
+        if len(sorted_responses) <= 1:
+            return "single moment"
+        
+        start_time = datetime.fromtimestamp(sorted_responses[0]['timestamp'])
+        end_time = datetime.fromtimestamp(sorted_responses[-1]['timestamp'])
+        duration = end_time - start_time
+        
+        return f"{duration.total_seconds():.0f} seconds"
+    
     def _update_cost_tracking(self, response: dict):
         """
         Update cost tracking based on API response usage.
@@ -489,6 +676,84 @@ class LLMSink:
         except Exception as e:
             if self.debug_mode:
                 print(f"[LLM COST] Error updating cost tracking: {e}")
+    
+    def _process_response(self, image_path: str, response: dict):
+        """
+        Process LLM response based on mode (summary or alert).
+        
+        Args:
+            image_path: Path to the image that was analyzed
+            response: LLM API response
+        """
+        try:
+            # Extract response content
+            llm_content = response.get("choices", [{}])[0].get("message", {}).get("content", "")
+            
+            if self.debug_mode:
+                print(f"[ALERT DEBUG] Raw LLM content: {llm_content[:200]}...")
+            
+            # Try to parse as JSON
+            try:
+                # Clean JSON content (remove markdown code blocks if present)
+                clean_content = llm_content.strip()
+                if "```json" in clean_content:
+                    clean_content = clean_content.split("```json")[1].split("```")[0].strip()
+                elif "```" in clean_content:
+                    clean_content = clean_content.split("```")[1].strip()
+                
+                parsed_response = json.loads(clean_content)
+                if self.debug_mode:
+                    print(f"[ALERT DEBUG] Parsed JSON successfully: {parsed_response}")
+            except Exception as e:
+                # If not JSON, treat as plain text
+                parsed_response = {"raw_response": llm_content}
+                if self.debug_mode:
+                    print(f"[ALERT DEBUG] JSON parsing failed: {e}")
+                    print(f"[ALERT DEBUG] Cleaned content was: {clean_content[:100] if 'clean_content' in locals() else 'N/A'}...")
+            
+            timestamp = time.time()
+            
+            if self.mode == "alert":
+                # Check for alerts - handle both boolean and string values
+                alert_value = parsed_response.get("alert", False)
+                if isinstance(alert_value, str):
+                    alert_triggered = alert_value.lower() in ['true', 'yes', '1']
+                else:
+                    alert_triggered = bool(alert_value)
+                
+                if self.debug_mode:
+                    print(f"[ALERT DEBUG] Raw alert field: {alert_value} (type: {type(alert_value)})")
+                    print(f"[ALERT DEBUG] Alert triggered: {alert_triggered}")
+                
+                if alert_triggered:
+                    self.alert_count += 1
+                    print(f"\n🚨 ALERT TRIGGERED! ({self.alert_count})")
+                    print(f"📷 Image: {Path(image_path).name}")
+                    print(f"🔍 Analysis: {parsed_response.get('description', parsed_response.get('analysis', 'No description'))}")
+                    if 'items_found' in parsed_response:
+                        print(f"🎯 Items: {parsed_response['items_found']}")
+                    if 'items' in parsed_response:
+                        print(f"🎯 Items: {parsed_response['items']}")
+                    confidence = parsed_response.get('confidence', 'N/A')
+                    print(f"📊 Confidence: {confidence}")
+                    print("=" * 60)
+                    
+            elif self.mode == "summary":
+                # Collect responses for summary
+                with self.response_lock:
+                    self.collected_responses.append({
+                        'timestamp': timestamp,
+                        'image_path': image_path,
+                        'response': parsed_response,
+                        'raw_content': llm_content
+                    })
+                    
+                    if self.debug_mode:
+                        print(f"[SUMMARY] Collected response #{len(self.collected_responses)} from {Path(image_path).name}")
+                        
+        except Exception as e:
+            if self.debug_mode:
+                print(f"[RESPONSE] Error processing response: {e}")
     
     def _save_analysis(self, image_path: str, response: dict):
         """

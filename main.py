@@ -85,7 +85,8 @@ class VideoGatingSystem:
             dry_run=args.dry_run,
             num_workers=args.llm_workers,
             similarity_threshold=args.similarity_threshold,
-            debug_mode=getattr(args, 'debug', False)
+            debug_mode=getattr(args, 'debug', False),
+            mode=getattr(args, 'mode', 'summary')
         )
         
         # Timing and display
@@ -736,12 +737,25 @@ class VideoGatingSystem:
             dedup_stats = llm_stats['similarity_dedup']
             cost_stats = llm_stats['cost_tracking']
             
-            print(f"\nLLM PROCESSING & DEDUPLICATION:")
+            print(f"\nLLM PROCESSING & DEDUPLICATION ({self.llm_sink.mode.upper()} MODE):")
             print(f"Total images requested for LLM: {dedup_stats['total_requested']}")
             print(f"Images removed by deduplication: {dedup_stats['skipped_similar']}")
             print(f"Images sent to LLM: {dedup_stats['sent_to_llm']}")
             print(f"Deduplication efficiency: {dedup_stats['efficiency_percent']:.1f}%")
             print(f"Similarity threshold: {dedup_stats['threshold']}")
+            
+            # Mode-specific output
+            if self.llm_sink.mode == "alert":
+                print(f"🚨 Total alerts triggered: {self.llm_sink.alert_count}")
+            elif self.llm_sink.mode == "summary":
+                print(f"📝 Responses collected for summary: {len(self.llm_sink.collected_responses)}")
+                # Generate and display synthesis
+                if self.llm_sink.collected_responses:
+                    print("🔄 Generating comprehensive answer...")
+                    synthesis = self.llm_sink.generate_synthesis_summary()
+                    print(f"\n{synthesis}")
+                else:
+                    print("⚠️  No responses collected for summary")
             
             print(f"\nLLM COST TRACKING ({cost_stats['model']}):")
             print(f"Total tokens used: {cost_stats['total_tokens']:,}")
@@ -919,6 +933,8 @@ def main():
                        help="Number of parallel LLM worker threads (default: 4)")
     parser.add_argument("--similarity-threshold", type=float, default=0.90,
                        help="Image similarity threshold for deduplication (0.9 = 90% similar = skip)")
+    parser.add_argument("--mode", type=str, choices=["summary", "alert"], default="summary",
+                       help="Processing mode: 'summary' (combine all responses) or 'alert' (check each response for alerts)")
     parser.add_argument("--debug", action="store_true",
                        help="Enable verbose debug logging")
     

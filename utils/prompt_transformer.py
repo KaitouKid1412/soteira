@@ -22,45 +22,62 @@ class LLMPromptTransformer:
         self.client = openai.OpenAI(api_key=api_key)
         self.model = model
         
-    def transform_prompt(self, user_query: str) -> Dict:
+    def transform_prompt(self, user_query: str, mode: str = "summary") -> Dict:
         """
         Transform user query into image analysis prompt using LLM.
         
         Args:
             user_query: Original user query
+            mode: Processing mode ('summary' or 'alert')
             
         Returns:
             Dict with transformed prompt and metadata
         """
         
-        system_prompt = """You are a prompt transformation expert. Your job is to convert user queries about video/image analysis into specific, actionable prompts for a multimodal AI that will analyze individual images.
+        if mode == "alert":
+            system_prompt = """You are a prompt transformation expert. Your job is to convert user queries into image analysis prompts for ALERT monitoring systems.
 
-User queries might be like:
-- "fetch all pictures of humans"
-- "check if there are any cigarettes in the feed" 
-- "find cars in the video"
-- "detect weapons"
+Transform user queries into prompts that:
+1. Analyze ONE specific image 
+2. Return JSON with an 'alert' field (true/false)
+3. Focus on detection/identification for alerting
 
-Transform these into specific image analysis prompts that:
-1. Ask about ONE specific image (not multiple/video)
-2. Request JSON response format
-3. Are clear and actionable
-
-Respond ONLY with valid JSON in this format:
+Respond ONLY with valid JSON:
 {
-  "image_prompt": "The specific prompt to send with each image",
-  "intent": "detection|counting|presence|analysis", 
-  "target_objects": ["list", "of", "objects"],
-  "response_format": "Description of expected JSON response format",
-  "confidence_required": true/false
+  "image_prompt": "The prompt to send with each image",
+  "intent": "detection|analysis", 
+  "target_objects": ["objects to look for"],
+  "alert_condition": "When to set alert=true"
 }
 
 Examples:
-User: "fetch all pictures of humans"
-Response: {"image_prompt": "Is there a human/person visible in this image? Respond in JSON format: {'detected': true/false, 'count': number, 'confidence': 0-1, 'description': 'brief description of what you see'}", "intent": "detection", "target_objects": ["human", "person"], "response_format": "detected, count, confidence, description", "confidence_required": true}
+User: "detect weapons"
+Response: {"image_prompt": "Analyze this image for weapons or dangerous objects. Respond in JSON: {'detected': true/false, 'items': [], 'confidence': 0-1, 'description': 'what you see', 'alert': true/false}. Set alert=true if weapons are detected.", "intent": "detection", "target_objects": ["weapon", "gun", "knife"], "alert_condition": "Weapons or dangerous objects detected"}
 
-User: "check if there are cigarettes"  
-Response: {"image_prompt": "Analyze this image for cigarettes or smoking-related items. Respond in JSON format: {'detected': true/false, 'items_found': ['list of items'], 'confidence': 0-1, 'description': 'what you observed'}", "intent": "detection", "target_objects": ["cigarette", "smoking"], "response_format": "detected, items_found, confidence, description", "confidence_required": true}"""
+User: "check for smoking"
+Response: {"image_prompt": "Look for smoking or cigarettes in this image. Respond in JSON: {'detected': true/false, 'items': [], 'confidence': 0-1, 'description': 'observation', 'alert': true/false}. Set alert=true if smoking is detected.", "intent": "detection", "target_objects": ["cigarette", "smoking"], "alert_condition": "Smoking or cigarettes detected"}"""
+        else:  # summary mode
+            system_prompt = """You are a prompt transformation expert. Your job is to convert user queries into image analysis prompts for SUMMARY generation systems.
+
+Transform user queries into prompts that:
+1. Analyze ONE specific image thoroughly
+2. Return detailed JSON for later summarization
+3. Focus on comprehensive observation
+
+Respond ONLY with valid JSON:
+{
+  "image_prompt": "The prompt to send with each image",
+  "intent": "analysis|description", 
+  "target_objects": ["things to observe"],
+  "summary_focus": "What to emphasize for summary"
+}
+
+Examples:
+User: "What actions are users performing?"
+Response: {"image_prompt": "Analyze this image and describe what action or activity is happening. Respond in JSON: {'action': 'main activity', 'objects_used': [], 'people_count': number, 'confidence': 0-1, 'detailed_description': 'comprehensive observation'}. Focus on actions and interactions.", "intent": "analysis", "target_objects": ["person", "action", "interaction"], "summary_focus": "User actions and activities over time"}
+
+User: "monitor office activity"
+Response: {"image_prompt": "Describe the office activity in this image. Respond in JSON: {'activity_type': 'description', 'people_present': number, 'objects_visible': [], 'environment': 'setting description', 'confidence': 0-1}. Provide detailed observations.", "intent": "analysis", "target_objects": ["office", "people", "activity"], "summary_focus": "Office environment and work patterns"}"""
 
         try:
             response = self.client.chat.completions.create(
@@ -86,6 +103,7 @@ Response: {"image_prompt": "Analyze this image for cigarettes or smoking-related
             
             # Add metadata
             transformation["original_query"] = user_query
+            transformation["mode"] = mode
             transformation["transformation_success"] = True
             
             return transformation
@@ -126,39 +144,72 @@ Response: {"image_prompt": "Analyze this image for cigarettes or smoking-related
 class SimplePromptTransformer:
     """Simple rule-based transformer for testing without API calls."""
     
-    def transform_prompt(self, user_query: str) -> Dict:
+    def transform_prompt(self, user_query: str, mode: str = "summary") -> Dict:
         """Simple transformation for testing."""
         
         # Basic pattern matching
         query_lower = user_query.lower()
         
         if any(word in query_lower for word in ['human', 'person', 'people']):
-            return {
-                "image_prompt": "Is there a human/person visible in this image? Respond in JSON format: {'detected': true/false, 'count': number, 'confidence': 0-1, 'description': 'brief description'}",
-                "intent": "detection",
-                "target_objects": ["human", "person"],
-                "response_format": "detected, count, confidence, description",
-                "confidence_required": True,
-                "original_query": user_query,
-                "transformation_success": True
-            }
+            if mode == "alert":
+                return {
+                    "image_prompt": "Is there a human/person visible in this image? Respond in JSON format: {'detected': true/false, 'count': number, 'confidence': 0-1, 'description': 'brief description', 'alert': true/false}. Set alert=true if humans are detected.",
+                    "intent": "detection",
+                    "target_objects": ["human", "person"],
+                    "alert_condition": "Humans detected",
+                    "original_query": user_query,
+                    "mode": mode,
+                    "transformation_success": True
+                }
+            else:  # summary mode
+                return {
+                    "image_prompt": "Describe any people visible in this image in detail. Respond in JSON format: {'people_count': number, 'activities': ['list of activities'], 'descriptions': ['detailed descriptions'], 'confidence': 0-1}",
+                    "intent": "analysis", 
+                    "target_objects": ["human", "person"],
+                    "summary_focus": "People and their activities",
+                    "original_query": user_query,
+                    "mode": mode,
+                    "transformation_success": True
+                }
         elif any(word in query_lower for word in ['cigarette', 'smoking', 'smoke']):
-            return {
-                "image_prompt": "Look for cigarettes or smoking-related items in this image. Respond in JSON format: {'detected': true/false, 'items_found': [], 'confidence': 0-1, 'description': 'what you see'}",
-                "intent": "detection", 
-                "target_objects": ["cigarette", "smoking"],
-                "response_format": "detected, items_found, confidence, description",
-                "confidence_required": True,
-                "original_query": user_query,
-                "transformation_success": True
-            }
+            if mode == "alert":
+                return {
+                    "image_prompt": "Look for cigarettes or smoking-related items in this image. Respond in JSON format: {'detected': true/false, 'items_found': [], 'confidence': 0-1, 'description': 'what you see', 'alert': true/false}. Set alert=true if smoking is detected.",
+                    "intent": "detection", 
+                    "target_objects": ["cigarette", "smoking"],
+                    "alert_condition": "Smoking or cigarettes detected",
+                    "original_query": user_query,
+                    "mode": mode,
+                    "transformation_success": True
+                }
+            else:  # summary mode
+                return {
+                    "image_prompt": "Observe and describe any smoking-related activities or items in this image. Respond in JSON format: {'smoking_present': true/false, 'items_observed': [], 'context': 'environmental context', 'confidence': 0-1}",
+                    "intent": "analysis",
+                    "target_objects": ["cigarette", "smoking"],
+                    "summary_focus": "Smoking behavior patterns",
+                    "original_query": user_query,
+                    "mode": mode,
+                    "transformation_success": True
+                }
         else:
-            return {
-                "image_prompt": f"Analyze this image for: '{user_query}'. Respond in JSON format: {{'analysis': 'description', 'relevant_objects': [], 'confidence': 0-1}}",
-                "intent": "analysis",
-                "target_objects": [],
-                "response_format": "analysis, relevant_objects, confidence",
-                "confidence_required": True,
-                "original_query": user_query,
-                "transformation_success": True
-            }
+            if mode == "alert":
+                return {
+                    "image_prompt": f"Analyze this image for: '{user_query}'. Respond in JSON format: {{'analysis': 'description', 'relevant_objects': [], 'confidence': 0-1, 'alert': true/false}}. Set alert=true if anything noteworthy or concerning is found.",
+                    "intent": "analysis",
+                    "target_objects": [],
+                    "alert_condition": "Noteworthy or concerning content detected",
+                    "original_query": user_query,
+                    "mode": mode,
+                    "transformation_success": True
+                }
+            else:  # summary mode
+                return {
+                    "image_prompt": f"Provide a comprehensive analysis of this image for: '{user_query}'. Respond in JSON format: {{'analysis': 'detailed description', 'relevant_objects': [], 'context': 'environmental context', 'confidence': 0-1}}",
+                    "intent": "analysis",
+                    "target_objects": [],
+                    "summary_focus": "Comprehensive scene understanding",
+                    "original_query": user_query,
+                    "mode": mode,
+                    "transformation_success": True
+                }
