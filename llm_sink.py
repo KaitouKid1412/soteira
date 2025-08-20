@@ -61,20 +61,34 @@ def extract_image_features_fast(image_source) -> np.ndarray:
         return np.zeros(64)
 
 
-def encode_image_to_base64(image_path: str) -> str:
-    """Encode image to base64 for OpenAI API."""
-    with open(image_path, "rb") as image_file:
-        return base64.b64encode(image_file.read()).decode('utf-8')
+def encode_image_to_base64(image_source) -> str:
+    """Encode image to base64 for OpenAI API.
+    
+    Args:
+        image_source: Either file path (str) or cv2 image array (numpy.ndarray)
+    """
+    if isinstance(image_source, str):
+        # File path provided
+        with open(image_source, "rb") as image_file:
+            return base64.b64encode(image_file.read()).decode('utf-8')
+    else:
+        # Numpy array provided (cv2 image)
+        import cv2
+        # Encode image to JPEG in memory
+        success, buffer = cv2.imencode('.jpg', image_source)
+        if not success:
+            raise Exception("Failed to encode image to JPEG")
+        return base64.b64encode(buffer).decode('utf-8')
 
 
-def send_to_openai_vision(prompt: str, image_path: str, api_key: str, 
+def send_to_openai_vision(prompt: str, image_source, api_key: str, 
                          model: str = "gpt-4o") -> dict:
     """
     Send image and prompt to OpenAI GPT-4 Vision API.
     
     Args:
         prompt: Text prompt for analysis
-        image_path: Path to image file
+        image_source: Path to image file (str) or cv2 image array (numpy.ndarray)
         api_key: OpenAI API key
         model: Model to use (default: gpt-4o)
         
@@ -83,7 +97,7 @@ def send_to_openai_vision(prompt: str, image_path: str, api_key: str,
     """
     try:
         # Encode image
-        base64_image = encode_image_to_base64(image_path)
+        base64_image = encode_image_to_base64(image_source)
         
         # Initialize OpenAI client
         client = openai.OpenAI(api_key=api_key)
@@ -200,7 +214,7 @@ class LLMSink:
     
     def __init__(self, user_query: str, openai_api_key: Optional[str] = None, 
                  dry_run: bool = False, max_queue_size: int = 100, num_workers: int = 4,
-                 similarity_threshold: float = 0.90):
+                 similarity_threshold: float = 0.90, debug_mode: bool = False):
         """
         Initialize LLM sink.
         
@@ -211,12 +225,14 @@ class LLMSink:
             max_queue_size: Maximum number of queued requests
             num_workers: Number of parallel worker threads
             similarity_threshold: Cosine similarity threshold (0.9 = 90% similar = skip)
+            debug_mode: Enable verbose debug logging
         """
         self.user_query = user_query
         self.openai_api_key = openai_api_key
         self.dry_run = dry_run
         self.max_queue_size = max_queue_size
         self.similarity_threshold = similarity_threshold
+        self.debug_mode = debug_mode
         
         # Image similarity tracking - maintain history of sent images
         self.sent_image_features = []  # List of all sent image features
@@ -263,6 +279,15 @@ class LLMSink:
         self.requests_rate_limited = 0
         self.start_time = time.time()
         
+        # Cost tracking (for gpt-4o default model)
+        self.total_prompt_tokens = 0
+        self.total_completion_tokens = 0
+        self.total_cost_usd = 0.0
+        
+        # GPT-4o pricing per 1M tokens (as of 2024)
+        self.gpt4o_input_cost = 2.50    # $2.50 per 1M input tokens
+        self.gpt4o_output_cost = 10.00  # $10.00 per 1M output tokens
+        
         # Create analysis directory
         self.analysis_dir = Path("events") / "llm_analysis"
         self.analysis_dir.mkdir(exist_ok=True)
@@ -295,6 +320,9 @@ class LLMSink:
         Args:
             worker_id: Unique ID for this worker thread
         """
+        if self.debug_mode:
+            print(f"[LLM-{worker_id}] Worker thread started")
+        
         while self.running:
             try:
                 # Get request from queue (with timeout)
@@ -303,7 +331,10 @@ class LLMSink:
                 except queue.Empty:
                     continue
                 
-                _, image_path = request  # We now ignore the original prompt and use transformed one
+                _, image_path, frame_data = request  # We now ignore the original prompt and use transformed one
+                
+                if self.debug_mode:
+                    print(f"[LLM-{worker_id}] Processing request for: {image_path}")
                 
                 # Check for rate limiting backoff
                 with self.rate_limit_lock:
@@ -333,9 +364,13 @@ class LLMSink:
                     else:
                         # Use real API or stub based on setup
                         if self.use_real_api and self.openai_api_key:
-                            response = self._call_openai_with_retry(image_path, worker_id)
+                            response = self._call_openai_with_retry(image_path, frame_data, worker_id)
                         else:
                             response = send_to_gpt_stub(self.image_prompt, image_path)
+                    
+                    # Update cost tracking (only for real API calls)
+                    if self.use_real_api and self.openai_api_key and not self.dry_run:
+                        self._update_cost_tracking(response)
                     
                     # Save response and analysis
                     self._save_analysis(image_path, response)
@@ -352,11 +387,12 @@ class LLMSink:
                 print(f"[LLM-{worker_id}] Worker loop error: {e}")
                 time.sleep(0.1)
     
-    def _call_openai_with_retry(self, image_path: str, worker_id: int, max_retries: int = 3) -> dict:
+    def _call_openai_with_retry(self, image_path: str, frame_data, worker_id: int, max_retries: int = 3) -> dict:
         """Call OpenAI API with retry logic for rate limiting.
         
         Args:
-            image_path: Path to image file
+            image_path: Path to image file (for logging)
+            frame_data: Image data as numpy array (preferred) or None to use file path
             worker_id: Worker thread ID for logging
             max_retries: Maximum number of retries
             
@@ -365,7 +401,9 @@ class LLMSink:
         """
         for attempt in range(max_retries + 1):
             try:
-                response = send_to_openai_vision(self.image_prompt, image_path, self.openai_api_key)
+                # Use frame_data if available, otherwise fall back to image_path
+                image_source = frame_data if frame_data is not None else image_path
+                response = send_to_openai_vision(self.image_prompt, image_source, self.openai_api_key)
                 return response
                 
             except Exception as e:
@@ -420,6 +458,37 @@ class LLMSink:
         
         # Should never reach here
         raise Exception("Unexpected end of retry loop")
+    
+    def _update_cost_tracking(self, response: dict):
+        """
+        Update cost tracking based on API response usage.
+        
+        Args:
+            response: API response dict containing usage information
+        """
+        try:
+            usage = response.get('usage', {})
+            prompt_tokens = usage.get('prompt_tokens', 0)
+            completion_tokens = usage.get('completion_tokens', 0)
+            
+            # Update totals
+            self.total_prompt_tokens += prompt_tokens
+            self.total_completion_tokens += completion_tokens
+            
+            # Calculate cost for this request (convert from per-1M-tokens to per-token)
+            prompt_cost = (prompt_tokens / 1_000_000) * self.gpt4o_input_cost
+            completion_cost = (completion_tokens / 1_000_000) * self.gpt4o_output_cost
+            request_cost = prompt_cost + completion_cost
+            
+            self.total_cost_usd += request_cost
+            
+            if self.debug_mode:
+                print(f"[LLM COST] Request: ${request_cost:.4f} "
+                      f"(input: {prompt_tokens} tokens, output: {completion_tokens} tokens)")
+                      
+        except Exception as e:
+            if self.debug_mode:
+                print(f"[LLM COST] Error updating cost tracking: {e}")
     
     def _save_analysis(self, image_path: str, response: dict):
         """
@@ -522,7 +591,7 @@ class LLMSink:
         self.similarity_stats['total_requested'] += 1
         
         # DEBUG: Always print first few calls
-        if self.similarity_stats['total_requested'] <= 5:
+        if self.debug_mode and self.similarity_stats['total_requested'] <= 5:
             print(f"[DEBUG] enqueue_to_llm called #{self.similarity_stats['total_requested']}: {image_path}")
         
         # Extract features from new image (use frame_data if available to avoid race condition)
@@ -530,13 +599,13 @@ class LLMSink:
         new_features = extract_image_features_fast(image_source)
         
         # DEBUG: Check if features are valid
-        if self.similarity_stats['total_requested'] <= 3:
+        if self.debug_mode and self.similarity_stats['total_requested'] <= 3:
             print(f"[DEBUG] Features extracted: shape={new_features.shape}, min={new_features.min():.3f}, max={new_features.max():.3f}, norm={np.linalg.norm(new_features):.3f}")
         
         # Check similarity against ALL previously sent images
         if len(self.sent_image_features) > 0:
             # DEBUG: Always print for first few comparisons
-            if self.similarity_stats['total_requested'] <= 5:
+            if self.debug_mode and self.similarity_stats['total_requested'] <= 5:
                 print(f"[DEBUG] Comparing against {len(self.sent_image_features)} previous images")
             
             # Calculate similarities to all previous images (vectorized for speed)
@@ -544,7 +613,7 @@ class LLMSink:
             max_similarity = max(similarities)
             
             # DEBUG: Always show first few similarity checks
-            if self.similarity_stats['total_requested'] <= 10:
+            if self.debug_mode and self.similarity_stats['total_requested'] <= 10:
                 print(f"[DEBUG] #{self.similarity_stats['total_requested']} Max similarity: {max_similarity:.4f}, threshold: {self.similarity_threshold}")
                 if len(similarities) >= 3:
                     print(f"[DEBUG] Top 3 similarities: {sorted(similarities, reverse=True)[:3]}")
@@ -552,16 +621,18 @@ class LLMSink:
             if max_similarity > self.similarity_threshold:
                 self.similarity_stats['skipped_similar'] += 1
                 similar_idx = similarities.index(max_similarity)
-                print(f"[LLM] SKIPPED: Image too similar ({max_similarity:.3f} > {self.similarity_threshold}) to image #{similar_idx+1} - {image_path}")
+                if self.debug_mode:
+                    print(f"[LLM] SKIPPED: Image too similar ({max_similarity:.3f} > {self.similarity_threshold}) to image #{similar_idx+1} - {image_path}")
                 return False
         else:
             # DEBUG: First image
-            if self.similarity_stats['total_requested'] == 1:
+            if self.debug_mode and self.similarity_stats['total_requested'] == 1:
                 print(f"[DEBUG] First image - no previous images to compare against")
         
         try:
             # Image is unique enough, queue for LLM processing
-            self.request_queue.put((prompt, image_path), block=False)
+            # Store prompt, image_path, and frame_data (for race condition safety)
+            self.request_queue.put((prompt, image_path, frame_data), block=False)
             
             # Add to sent image history (maintain sliding window)
             self.sent_image_features.append(new_features)
@@ -572,8 +643,9 @@ class LLMSink:
             
             self.similarity_stats['sent_to_llm'] += 1
             
-            print(f"[LLM] QUEUED: Image accepted for processing ({self.similarity_stats['sent_to_llm']}/{self.similarity_stats['total_requested']} sent)")
-            print(f"[LLM] ✓ SENDING TO LLM: {image_path}")
+            if self.debug_mode:
+                print(f"[LLM] QUEUED: Image accepted for processing ({self.similarity_stats['sent_to_llm']}/{self.similarity_stats['total_requested']} sent)")
+                print(f"[LLM] ✓ SENDING TO LLM: {image_path}")
             
             # Optional: Save copy of LLM-sent images to separate directory for review
             self._log_sent_image(image_path, frame_data)
@@ -609,6 +681,15 @@ class LLMSink:
                 "sent_to_llm": self.similarity_stats['sent_to_llm'],
                 "efficiency_percent": efficiency_percent,
                 "threshold": self.similarity_threshold
+            },
+            "cost_tracking": {
+                "total_prompt_tokens": self.total_prompt_tokens,
+                "total_completion_tokens": self.total_completion_tokens,
+                "total_tokens": self.total_prompt_tokens + self.total_completion_tokens,
+                "total_cost_usd": self.total_cost_usd,
+                "model": "gpt-4o",
+                "input_cost_per_1m": self.gpt4o_input_cost,
+                "output_cost_per_1m": self.gpt4o_output_cost
             }
         }
     
@@ -667,11 +748,14 @@ class LLMSink:
         # Print final statistics
         stats = self.get_stats()
         dedup_stats = stats['similarity_dedup']
+        cost_stats = stats['cost_tracking']
         print(f"[LLM] Final stats: {stats['processed']} processed, "
               f"{stats['failed']} failed, "
               f"{stats.get('rate_limited', 0)} rate limited, "
               f"{stats['rate_per_minute']:.1f} req/min")
         print(f"[LLM] Similarity dedup: {dedup_stats['skipped_similar']}/{dedup_stats['total_requested']} "
               f"({dedup_stats['efficiency_percent']:.1f}%) skipped as duplicates (checked against {len(self.sent_image_features)} unique images)")
+        if cost_stats['total_cost_usd'] > 0:
+            print(f"[LLM] Total cost: ${cost_stats['total_cost_usd']:.4f} ({cost_stats['total_tokens']:,} tokens)")
         
         print("[LLM] Shutdown complete")

@@ -84,7 +84,8 @@ class VideoGatingSystem:
             openai_api_key=args.openai_api_key,
             dry_run=args.dry_run,
             num_workers=args.llm_workers,
-            similarity_threshold=args.similarity_threshold
+            similarity_threshold=args.similarity_threshold,
+            debug_mode=getattr(args, 'debug', False)
         )
         
         # Timing and display
@@ -105,6 +106,16 @@ class VideoGatingSystem:
         
         # Thread-safe logging
         self.log_lock = threading.Lock()
+        
+        # Gate trigger counters
+        self.gate_triggers = {
+            'motion': 0,
+            'scene': 0,
+            'object': 0
+        }
+        
+        # Debug mode
+        self.debug_mode = getattr(args, 'debug', False)
         
         # Frame buffer for quality capture
         self.frame_buffer = FrameBuffer(max_pending=10, capture_timeout=3.0)
@@ -284,7 +295,7 @@ class VideoGatingSystem:
             display_frame = frame.copy()
             # We'll add overlays after processing, but show frame immediately for responsiveness
             self.update_display_frame(display_frame)
-            if self.frame_count == 1:
+            if self.debug_mode and self.frame_count == 1:
                 print("[DEBUG] First frame sent to display immediately")
         
         # Detailed timing breakdown for bottleneck analysis
@@ -341,11 +352,15 @@ class VideoGatingSystem:
         if skip_motion:
             changed_ratio = 1.0  # Force motion spike
             motion_spike = True
-            print(f"[SKIP] Motion gate bypassed - processing frame {self.frame_count}")
+            self.gate_triggers['motion'] += 1
+            if self.debug_mode:
+                print(f"[SKIP] Motion gate bypassed - processing frame {self.frame_count}")
         else:
             with self.perf_tracker.time_gate('motion'):
                 changed_ratio, motion_mask = self.motion_gate.apply_motion(frame_small)
                 motion_spike = changed_ratio > self.args.motion_thresh
+                if motion_spike:
+                    self.gate_triggers['motion'] += 1
         
         self.current_changed_ratio = changed_ratio
         self.perf_tracker.record_motion_result(motion_spike)
@@ -358,11 +373,15 @@ class VideoGatingSystem:
             if motion_spike:  # Only if motion was detected (or motion was skipped)
                 scene_changed = True
                 d_hist, ssim = 1.0, 0.0  # Force scene change values
-                print(f"[SKIP] Scene gate bypassed - processing frame {self.frame_count}")
+                self.gate_triggers['scene'] += 1
+                if self.debug_mode:
+                    print(f"[SKIP] Scene gate bypassed - processing frame {self.frame_count}")
         else:
             if motion_spike:
                 with self.perf_tracker.time_gate('scene'):
                     scene_changed, d_hist, ssim = self.scene_gate.check_scene_change(frame_small)
+                    if scene_changed:
+                        self.gate_triggers['scene'] += 1
         
         self.perf_tracker.record_scene_result(scene_changed)
         
@@ -386,7 +405,8 @@ class VideoGatingSystem:
         
         if skip_object:
             # Skip object detection entirely - no new tracks will be created
-            print(f"[SKIP] Object gate bypassed - no object detection for frame {self.frame_count}")
+            if self.debug_mode:
+                print(f"[SKIP] Object gate bypassed - no object detection for frame {self.frame_count}")
         else:
             should_detect = (
                 motion_spike or
@@ -394,6 +414,7 @@ class VideoGatingSystem:
             )
             
             if should_detect:
+                self.gate_triggers['object'] += 1
                 with self.perf_tracker.time_gate('object'):
                     detections, new_tracks = self.object_gate.process_frame(frame_small, frame)
         
@@ -431,7 +452,7 @@ class VideoGatingSystem:
         self.fps_counter.tick()
         
         # Add comprehensive frame statistics and timing breakdown (every 60 processed frames)
-        if self.frame_count % 60 == 0:
+        if self.debug_mode and self.frame_count % 60 == 0:
             total_time = time.time() - frame_start_time
             processing_fps = self.fps_counter.get_fps()
             
@@ -702,6 +723,36 @@ class VideoGatingSystem:
             # Shutdown async saver
             shutdown_async_saver()
             
+            # Print gate trigger statistics
+            print(f"\n{'='*60}")
+            print(f"GATE TRIGGER STATISTICS")
+            print(f"{'='*60}")
+            print(f"Motion gate triggers: {self.gate_triggers['motion']}")
+            print(f"Scene gate triggers: {self.gate_triggers['scene']}")  
+            print(f"Object gate triggers: {self.gate_triggers['object']}")
+            
+            # Print LLM and deduplication stats
+            llm_stats = self.llm_sink.get_stats()
+            dedup_stats = llm_stats['similarity_dedup']
+            cost_stats = llm_stats['cost_tracking']
+            
+            print(f"\nLLM PROCESSING & DEDUPLICATION:")
+            print(f"Total images requested for LLM: {dedup_stats['total_requested']}")
+            print(f"Images removed by deduplication: {dedup_stats['skipped_similar']}")
+            print(f"Images sent to LLM: {dedup_stats['sent_to_llm']}")
+            print(f"Deduplication efficiency: {dedup_stats['efficiency_percent']:.1f}%")
+            print(f"Similarity threshold: {dedup_stats['threshold']}")
+            
+            print(f"\nLLM COST TRACKING ({cost_stats['model']}):")
+            print(f"Total tokens used: {cost_stats['total_tokens']:,}")
+            print(f"  - Input tokens: {cost_stats['total_prompt_tokens']:,}")
+            print(f"  - Output tokens: {cost_stats['total_completion_tokens']:,}")
+            print(f"Total cost: ${cost_stats['total_cost_usd']:.4f}")
+            if cost_stats['total_cost_usd'] > 0:
+                avg_cost_per_image = cost_stats['total_cost_usd'] / max(dedup_stats['sent_to_llm'], 1)
+                print(f"Average cost per image: ${avg_cost_per_image:.4f}")
+            print(f"Pricing: ${cost_stats['input_cost_per_1m']}/1M input, ${cost_stats['output_cost_per_1m']}/1M output tokens")
+            
             # Print performance statistics and save final data
             self.perf_tracker.print_statistics()
             self.perf_tracker.save_final_stats()
@@ -868,6 +919,8 @@ def main():
                        help="Number of parallel LLM worker threads (default: 4)")
     parser.add_argument("--similarity-threshold", type=float, default=0.90,
                        help="Image similarity threshold for deduplication (0.9 = 90% similar = skip)")
+    parser.add_argument("--debug", action="store_true",
+                       help="Enable verbose debug logging")
     
     # High FPS optimization
     parser.add_argument("--enable-60fps-mode", action="store_true",
