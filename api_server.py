@@ -104,7 +104,7 @@ class VideoAnalysisServer:
                 scene_hist=0.7,  # Default since --skip-scene is True
                 scene_ssim=0.85,  # Default since --skip-scene is True  
                 buffer_frames=3,
-                similarity_threshold=0.75,  # Optimized for speed
+                similarity_threshold=0.9,
                 disable_quality_filter=True,
                 skip_scene=True
             ),
@@ -130,10 +130,10 @@ class VideoAnalysisServer:
                 motion_thresh=0.005,
                 conf=0.6,
                 imgsz=256,
-                scene_hist=0.05,
-                scene_ssim=0.05,
-                buffer_frames=5,
-                similarity_threshold=0.75,  # Optimized for speed  # Default since not specified in command
+                scene_hist=0.3,
+                scene_ssim=0.7,
+                buffer_frames=2,
+                similarity_threshold=0.65,  # Default since not specified in command
                 disable_quality_filter=True,
                 skip_scene=False,  # Note: restaurant command doesn't use --skip-scene
                 stop_on_good_frame=True
@@ -148,7 +148,7 @@ class VideoAnalysisServer:
                 scene_hist=0.50,
                 scene_ssim=0.45,
                 buffer_frames=5,
-                similarity_threshold=0.75,  # Optimized for speed
+                similarity_threshold=0.9,
                 disable_quality_filter=False,
                 skip_scene=False,
                 stop_on_good_frame=True
