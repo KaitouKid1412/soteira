@@ -264,6 +264,8 @@ class VideoGatingSystem:
     
     def process_frame(self, frame):
         self._total_frames_seen += 1  # Count every frame that enters processing
+        print(f"[DEBUG] PROCESSING FRAME {self._total_frames_seen}")
+        print(f"[DEBUG] ARGS CHECK: skip_scene={getattr(self.args, 'skip_scene', 'NOT_SET')}")
         self.frame_count += 1  # Will be reset if frame is dropped
         
         # High FPS sampling check
@@ -353,7 +355,8 @@ class VideoGatingSystem:
         
         # Gate controls - check individual skip flags or global bypass
         skip_motion = getattr(self.args, 'skip_motion', False) or getattr(self.args, 'bypass_gates', False)
-        skip_scene = getattr(self.args, 'skip_scene', False) or getattr(self.args, 'bypass_gates', False) 
+        skip_scene = getattr(self.args, 'skip_scene', False) or getattr(self.args, 'bypass_gates', False)
+        print(f"[DEBUG] Frame {self.frame_count}: skip_scene={skip_scene}, args.skip_scene={getattr(self.args, 'skip_scene', 'NOT_SET')}") 
         
         # Gate 1: Motion detection (or skip if requested)
         if skip_motion:
@@ -377,12 +380,10 @@ class VideoGatingSystem:
         scene_changed = False
         
         if skip_scene:
-            if motion_spike:  # Only if motion was detected (or motion was skipped)
-                scene_changed = True
-                d_hist, ssim = 1.0, 0.0  # Force scene change values
-                self.gate_triggers['scene'] += 1
-                if self.debug_mode:
-                    print(f"[SKIP] Scene gate bypassed - processing frame {self.frame_count}")
+            # Scene gate is completely bypassed - no scene changes are detected
+            scene_changed = False
+            d_hist, ssim = 1.0, 0.0  # Default values when scene gate is skipped
+            print(f"[DEBUG] Scene gate SKIPPED for frame {self.frame_count}")
         else:
             if motion_spike:
                 with self.perf_tracker.time_gate('scene'):
@@ -735,6 +736,16 @@ class VideoGatingSystem:
                         time.sleep(2)
                         cap.release()
                         cap = cv2.VideoCapture(source)
+                        continue
+                    elif using_phone:
+                        # Check if phone connection is still healthy
+                        if hasattr(cap, 'get_stats'):
+                            stats = cap.get_stats()
+                            last_frame_age = time.time() - stats.get('last_successful_fetch', 0)
+                            if last_frame_age > 10:  # No frames for 10 seconds = real disconnect
+                                print("Phone connection lost - no frames for 10+ seconds")
+                                break
+                        # For temporary unavailability, just continue without delay
                         continue
                     else:
                         print("End of video or read error")

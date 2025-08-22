@@ -1295,6 +1295,7 @@ The user appears to be engaged in {', '.join(unique_activities[:3]) if unique_ac
                 if self.debug_mode and self.similarity_stats['sent_to_llm'] <= 10:
                     print(f"[WORKER] Max similarity: {max_similarity:.4f}, threshold: {self.similarity_threshold}")
                 
+                print(f"[IMPPP!!!!] Max similarity ({max_similarity:.3f}) and threshold ({self.similarity_threshold})")
                 if max_similarity > self.similarity_threshold:
                     self.similarity_stats['skipped_similar'] += 1
                     similar_idx = similarities.index(max_similarity)

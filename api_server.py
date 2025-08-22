@@ -17,6 +17,7 @@ import queue
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, StreamingResponse, Response
+from numpy import False_
 from pydantic import BaseModel
 import uvicorn
 
@@ -99,10 +100,10 @@ class VideoAnalysisServer:
                 mode="alert",
                 prompt="Alert me if my babies are in danger ?",
                 motion_thresh=0.001,
-                conf=0.3,
+                conf=0.4,
                 imgsz=320,
-                scene_hist=0.7,  # Default since --skip-scene is True
-                scene_ssim=0.85,  # Default since --skip-scene is True  
+                scene_hist=0.5,  # Default since --skip-scene is True
+                scene_ssim=0.5,  # Default since --skip-scene is True  
                 buffer_frames=3,
                 similarity_threshold=0.9,
                 disable_quality_filter=True,
@@ -120,15 +121,15 @@ class VideoAnalysisServer:
                 buffer_frames=3,
                 similarity_threshold=0.75,  # Optimized for speed
                 disable_quality_filter=True,
-                skip_scene=True,
+                skip_scene=False,
                 stop_on_good_frame=True
             ),
             "restaurant.mov": ProcessingConfig(
                 video_path="videos/restaurant.mov",
                 mode="alert",
                 prompt="Alert me whenever you see meat in the video ?",
-                motion_thresh=0.005,
-                conf=0.6,
+                motion_thresh=0.2,
+                conf=0.7,
                 imgsz=256,
                 scene_hist=0.3,
                 scene_ssim=0.7,
@@ -151,6 +152,21 @@ class VideoAnalysisServer:
                 similarity_threshold=0.9,
                 disable_quality_filter=False,
                 skip_scene=False,
+                stop_on_good_frame=True
+            ),
+            "movie": ProcessingConfig(
+                video_path="movie.mp4",
+                mode="alert",
+                prompt="Alert me whenever a person performs any action in the video, descibe every in detail.",
+                motion_thresh=0.001,
+                conf=0.3,
+                imgsz=320,
+                scene_hist=0.7,
+                scene_ssim=0.85,
+                buffer_frames=3,
+                similarity_threshold=0.7,
+                disable_quality_filter=True,
+                skip_scene=True,
                 stop_on_good_frame=True
             )
         }
@@ -198,6 +214,19 @@ class VideoAnalysisServer:
             """Start video processing with given configuration."""
             if self.is_processing:
                 raise HTTPException(status_code=400, detail="Processing already running")
+            
+            # Check if this matches a known preset and use the full preset config
+            presets = self.get_video_presets()
+            for preset_name, preset_config in presets.items():
+                if preset_config.video_path == config.video_path:
+                    print(f"[API] Detected preset usage: {preset_name} for {config.video_path}")
+                    # Use preset config but override with any explicit values from request
+                    preset_dict = preset_config.model_dump()
+                    preset_dict['mode'] = config.mode  # Override with user's mode selection
+                    preset_dict['prompt'] = config.prompt  # Override with user's prompt
+                    config = ProcessingConfig(**preset_dict)
+                    print(f"[API] Applied preset config: skip_scene={config.skip_scene}")
+                    break
             
             # Validate video file exists (skip for phone stream)
             if config.video_path != "phone" and not Path(config.video_path).exists():
@@ -268,12 +297,14 @@ class VideoAnalysisServer:
         @self.app.get("/video_feed")
         async def video_feed():
             """Stream current video frames."""
+            # Check for phone stream first - it may be available even when processing is paused
+            if (self.current_config and self.current_config.video_path == "phone"):
+                return await self.proxy_phone_video_feed()
+            
             if not self.is_processing:
                 raise HTTPException(status_code=404, detail="No active video processing")
             
-            # Check if this is a phone stream - if so, proxy from video server
-            if (self.current_config and self.current_config.video_path == "phone"):
-                return await self.proxy_phone_video_feed()
+            # Phone stream already handled above
             
             # For non-phone sources, use the web display
             if not self.video_system or not hasattr(self.video_system, 'web_display') or not self.video_system.web_display:
@@ -365,24 +396,42 @@ class VideoAnalysisServer:
             raise HTTPException(status_code=500, detail="aiohttp not available for phone video streaming")
         
         async def generate_phone_frames():
+            retry_count = 0
+            max_retries = 5
+            
             try:
                 # Connect to the video server's stream endpoint
-                timeout = aiohttp.ClientTimeout(total=None, sock_read=1)
-                connector = aiohttp.TCPConnector(verify_ssl=False)
+                timeout = aiohttp.ClientTimeout(total=None, sock_read=2, sock_connect=5)
+                connector = aiohttp.TCPConnector(verify_ssl=False, limit=10, limit_per_host=10)
                 async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-                    while self.is_processing:
+                    while self.current_config and self.current_config.video_path == "phone":
                         try:
                             async with session.get("https://localhost:8443/stream/frame") as response:
                                 if response.status == 200:
                                     frame_data = await response.read()
+                                    retry_count = 0  # Reset retry count on success
                                     yield (b'--frame\r\n'
                                            b'Content-Type: image/jpeg\r\n\r\n' + frame_data + b'\r\n')
-                                else:
-                                    # No frame available, wait a bit
+                                elif response.status == 408:  # Timeout - frame too old
+                                    await asyncio.sleep(0.05)
+                                elif response.status == 404:  # No frame available
                                     await asyncio.sleep(0.033)
+                                else:
+                                    print(f"[API] Unexpected response status: {response.status}")
+                                    await asyncio.sleep(0.1)
+                        except asyncio.TimeoutError:
+                            retry_count += 1
+                            if retry_count > max_retries:
+                                print(f"[API] Phone proxy timeout after {max_retries} retries")
+                                break
+                            await asyncio.sleep(0.5)
                         except Exception as e:
+                            retry_count += 1
                             print(f"[API] Phone proxy error: {e}")
-                            await asyncio.sleep(0.1)
+                            if retry_count > max_retries:
+                                print(f"[API] Phone proxy failed after {max_retries} retries")
+                                break
+                            await asyncio.sleep(0.2)
             except Exception as e:
                 print(f"[API] Phone proxy session error: {e}")
         
@@ -432,6 +481,27 @@ class VideoAnalysisServer:
             Path("./events").mkdir(exist_ok=True)
             Path("./events/llm_analysis").mkdir(exist_ok=True, parents=True)
             
+            # Log all configuration parameters being used
+            print(f"{'='*80}")
+            print(f"VIDEO PROCESSING CONFIGURATION")
+            print(f"{'='*80}")
+            print(f"Video Path: {self.current_config.video_path}")
+            print(f"Mode: {self.current_config.mode}")
+            print(f"Prompt: {self.current_config.prompt}")
+            print(f"Motion Threshold: {self.current_config.motion_thresh}")
+            print(f"Scene Histogram: {self.current_config.scene_hist}")
+            print(f"Scene SSIM: {self.current_config.scene_ssim}")
+            print(f"Skip Scene: {self.current_config.skip_scene}")
+            print(f"Confidence: {self.current_config.conf}")
+            print(f"Image Size: {self.current_config.imgsz}")
+            print(f"Buffer Frames: {self.current_config.buffer_frames}")
+            print(f"Similarity Threshold: {self.current_config.similarity_threshold}")
+            print(f"Disable Quality Filter: {self.current_config.disable_quality_filter}")
+            print(f"Stop on Good Frame: {self.current_config.stop_on_good_frame}")
+            print(f"Stream Loop: False (hardcoded)")
+            print(f"No Stream Loop: True (hardcoded)")
+            print(f"{'='*80}")
+
             # Create arguments object similar to main.py
             args = argparse.Namespace(
                 # Basic config
