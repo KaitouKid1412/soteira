@@ -39,9 +39,9 @@ class PhoneStreamServer:
             if self.latest_frame is None:
                 return web.Response(status=404, text="No frame available")
             
-            # Check if frame is fresh (less than 1 second old for better responsiveness)
+            # Check if frame is fresh (increased to 5 seconds to handle temporary pauses)
             frame_age = time.time() - self.frame_timestamp
-            if frame_age > 1.0:
+            if frame_age > 5.0:
                 return web.Response(status=408, text="Frame too old")
             
             # Encode frame as JPEG with optimized settings for web streaming

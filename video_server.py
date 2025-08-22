@@ -291,7 +291,11 @@ async def offer(request: web.Request):
     @pc.on("connectionstatechange")
     def on_connectionstatechange():
         print("Connection state:", pc.connectionState)
-        if pc.connectionState in ("failed", "closed", "disconnected"):
+        if pc.connectionState == "failed":
+            print("Connection failed, attempting restart...")
+            # Don't immediately close on failed state - allow for recovery
+        elif pc.connectionState in ("closed", "disconnected"):
+            print("Connection closed/disconnected, cleaning up...")
             asyncio.ensure_future(close_pc(pc))
 
     @pc.on("track")

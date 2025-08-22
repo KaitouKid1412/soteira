@@ -204,12 +204,15 @@ class FramePerformanceTracker:
         print(f"Average FPS: {stats['avg_fps']:.1f}")
         
         print(f"\nFRAME PROCESSING TIMES:")
-        print(f"  Total (full pipeline):")
-        print(f"    Min:    {stats['total_min_ms']:.2f}ms")
-        print(f"    Max:    {stats['total_max_ms']:.2f}ms") 
-        print(f"    Mean:   {stats['total_mean_ms']:.2f}ms")
-        print(f"    Median: {stats['total_median_ms']:.2f}ms")
-        print(f"    Frames: {stats['total_frames_processed']}")
+        if stats.get('total_frames_processed', 0) > 0:
+            print(f"  Total (full pipeline):")
+            print(f"    Min:    {stats.get('total_min_ms', 0):.2f}ms")
+            print(f"    Max:    {stats.get('total_max_ms', 0):.2f}ms") 
+            print(f"    Mean:   {stats.get('total_mean_ms', 0):.2f}ms")
+            print(f"    Median: {stats.get('total_median_ms', 0):.2f}ms")
+            print(f"    Frames: {stats.get('total_frames_processed', 0)}")
+        else:
+            print(f"  Total (full pipeline): No data available")
         
         for gate in ['motion', 'scene', 'object']:
             if stats[f'{gate}_frames_processed'] > 0:
