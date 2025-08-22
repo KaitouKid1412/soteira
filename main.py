@@ -39,6 +39,7 @@ from utils.frame_buffer import FrameBuffer
 from utils.performance import FramePerformanceTracker
 from utils.video_streamer import VideoStreamer
 from utils.frame_sampler import AdaptiveFrameSampler, MotionBasedSampler
+from utils.web_display import WebVideoDisplay
 
 
 class VideoGatingSystem:
@@ -79,6 +80,7 @@ class VideoGatingSystem:
         )
         
         # LLM sink with intelligent prompt transformation and parallel processing
+        # Will be updated with web display after web display is created
         self.llm_sink = LLMSink(
             user_query=args.prompt,
             openai_api_key=args.openai_api_key,
@@ -95,15 +97,14 @@ class VideoGatingSystem:
         self._total_frames_seen = 0  # Total frames from video (including dropped)
         self.running = True
         
-        # Async display system
-        self.display_frame = None
-        self.display_lock = threading.Lock()
-        self.display_thread = None
-        # Display control: enabled by default, unless --no-display is used
+        # Web-based display system
+        self.web_display = None
+        
+        # Display control: web display enabled by default, unless --no-display is used
         if getattr(args, 'no_display', False):
-            self.enable_async_display = False
+            self.enable_web_display = False
         else:
-            self.enable_async_display = True
+            self.enable_web_display = True
         
         # Thread-safe logging
         self.log_lock = threading.Lock()
@@ -273,7 +274,7 @@ class VideoGatingSystem:
                 print(f"[FRAME DROP] Total dropped: {dropped_count}, Reason: {drop_reason}")
             
             # Still update display even for dropped frames (for smooth preview)
-            if self.enable_async_display:
+            if self.enable_web_display:
                 display_frame = frame.copy()
                 # Draw minimal overlay for dropped frames
                 cv2.putText(display_frame, "FRAME DROPPED", (10, 30), 
@@ -292,7 +293,7 @@ class VideoGatingSystem:
             frame_small = cv2.resize(frame, (640, 360))
         
         # ALWAYS update display first (regardless of motion detection)
-        if self.enable_async_display:
+        if self.enable_web_display:
             display_frame = frame.copy()
             # We'll add overlays after processing, but show frame immediately for responsiveness
             self.update_display_frame(display_frame)
@@ -439,7 +440,7 @@ class VideoGatingSystem:
             )
         
         # Update display with overlays (frame was already sent above for immediate response)
-        if self.enable_async_display:
+        if self.enable_web_display:
             # Create display frame with full overlays
             display_frame = frame.copy()
             self.draw_overlays(display_frame, changed_ratio, d_hist, ssim, detections)
@@ -487,14 +488,39 @@ class VideoGatingSystem:
         # End performance tracking for this frame
         self.perf_tracker.end_frame()
     
-    def start_display_thread(self):
-        """Start the async display thread for real-time preview."""
-        if not self.enable_async_display:
+    def start_web_display(self):
+        """Start the web-based display system."""
+        if not self.enable_web_display:
             return
+        
+        # Start web-based display
+        port = getattr(self.args, 'web_port', 8888)
+        # Get source FPS for real-time display
+        source_fps = getattr(self, 'source_fps', 30.0)
+        # Override with user-specified display FPS if provided
+        display_fps = getattr(self.args, 'display_fps', None)
+        if display_fps is None:
+            display_fps = source_fps
+        
+        self.web_display = WebVideoDisplay(
+            port=port, 
+            target_fps=display_fps, 
+            user_prompt=self.args.prompt,
+            mode=getattr(self.args, 'mode', 'summary')
+        )
+        if self.web_display.start():
+            print("[WEB_DISPLAY] Started successfully")
+            print(f"[WEB_DISPLAY] View video at: http://localhost:{port}")
+            print(f"[WEB_DISPLAY] Display FPS: {display_fps:.1f} (Source: {source_fps:.1f})")
             
-        self.display_thread = threading.Thread(target=self._display_loop, daemon=True)
-        self.display_thread.start()
-        print("[DISPLAY] Started async display thread for real-time preview")
+            # Connect web display to LLM sink for notifications
+            self.llm_sink.web_display = self.web_display
+            
+            return True
+        else:
+            print("[WEB_DISPLAY] Failed to start web server")
+            self.enable_web_display = False
+            return False
     
     def _display_loop(self):
         """Background thread for smooth video display."""
@@ -608,12 +634,12 @@ class VideoGatingSystem:
         print(f"[DISPLAY] Display thread stopped after {frame_count} frames")
     
     def update_display_frame(self, frame):
-        """Update the frame for async display (thread-safe)."""
-        if not self.enable_async_display:
+        """Update the frame for web display."""
+        if not self.enable_web_display or not self.web_display:
             return
-            
-        with self.display_lock:
-            self.display_frame = frame.copy()
+        
+        # Send to web display
+        self.web_display.update_frame(frame)
     
     def run(self):
         # Setup video capture or streamer
@@ -646,6 +672,24 @@ class VideoGatingSystem:
             print(f"Error: Could not open video source: {source}")
             return
         
+        # Detect source FPS for real-time display
+        if using_streamer:
+            # For video streamer, get FPS from the streamer
+            self.source_fps = getattr(cap, 'fps', 30.0)
+        else:
+            # For regular video capture, get FPS from OpenCV
+            detected_fps = cap.get(cv2.CAP_PROP_FPS)
+            if detected_fps > 0 and detected_fps < 120:  # Reasonable FPS range
+                self.source_fps = detected_fps
+            else:
+                # Default FPS for webcams or invalid detection
+                if isinstance(source, int):  # Webcam
+                    self.source_fps = 30.0
+                else:  # Video file with invalid FPS
+                    self.source_fps = 25.0
+        
+        print(f"Detected source FPS: {self.source_fps:.1f}")
+        
         print(f"Starting video gating system on source: {source}")
         print(f"Save directory: {self.save_dir}")
         print(f"Motion threshold: {self.args.motion_thresh}")
@@ -653,14 +697,14 @@ class VideoGatingSystem:
         print(f"Scene SSIM threshold: {self.args.scene_ssim}")
         print(f"Track max age: {self.args.max_age_seconds}s")
         
-        print(f"Async display enabled: {self.enable_async_display}")
+        print(f"Web display enabled: {self.enable_web_display}")
         
-        # Start async display thread for real-time preview (only if enabled)
-        if self.enable_async_display:
-            print("Starting display thread...")
-            self.start_display_thread()
+        # Start web display system for real-time preview (only if enabled)
+        if self.enable_web_display:
+            print("Starting web display system...")
+            self.start_web_display()
         else:
-            print("Display thread not started (async display disabled)")
+            print("Web display system disabled")
         
         # Main processing loop
         try:
@@ -675,6 +719,13 @@ class VideoGatingSystem:
                         continue
                     else:
                         print("End of video or read error")
+                        # Mark video as ended for web display
+                        if self.enable_web_display and self.web_display:
+                            self.web_display.set_video_ended(True)
+                            # Generate and set summary if in summary mode
+                            if getattr(self.args, 'mode', 'summary') == 'summary':
+                                summary = self.llm_sink.generate_synthesis_summary()
+                                self.web_display.set_summary(summary)
                         break
                 
                 # Check if shutdown was requested before processing
@@ -707,8 +758,17 @@ class VideoGatingSystem:
                       f"{stats['actual_fps']:.1f} FPS avg")
             cap.release()
             
-            if self.enable_async_display:
-                cv2.destroyAllWindows()
+            # Generate summary before cleanup if in summary mode
+            if getattr(self.args, 'mode', 'summary') == 'summary' and self.llm_sink.collected_responses:
+                print("🔄 Generating final summary...")
+                final_summary = self.llm_sink.generate_synthesis_summary()
+                if self.enable_web_display and self.web_display:
+                    self.web_display.set_summary(final_summary)
+                    print("[WEB_DISPLAY] Summary set for web interface")
+            
+            # Cleanup web display system
+            if self.enable_web_display and self.web_display:
+                self.web_display.stop()
             self.llm_sink.shutdown()
             
             # Wait for async file saves to complete
@@ -754,8 +814,15 @@ class VideoGatingSystem:
                     print("🔄 Generating comprehensive answer...")
                     synthesis = self.llm_sink.generate_synthesis_summary()
                     print(f"\n{synthesis}")
+                    
+                    # Also set summary in web display if available
+                    if self.enable_web_display and self.web_display:
+                        self.web_display.set_summary(synthesis)
                 else:
                     print("⚠️  No responses collected for summary")
+                    # Set empty summary message in web display
+                    if self.enable_web_display and self.web_display:
+                        self.web_display.set_summary("No responses were collected for summary generation.")
             
             print(f"\nLLM COST TRACKING ({cost_stats['model']}):")
             print(f"Total tokens used: {cost_stats['total_tokens']:,}")
@@ -923,10 +990,12 @@ def main():
                        help="Capture all buffer frames and pick the best (opposite of --stop-on-good-frame)")
     
     # Display and control
-    parser.add_argument("--realtime-display", action="store_true",
-                       help="Force enable real-time async display (enabled by default)")
+    parser.add_argument("--web-port", type=int, default=8888,
+                       help="Port for web display server (default: 8888)")
+    parser.add_argument("--display-fps", type=float, default=None,
+                       help="Force display FPS (overrides auto-detection, e.g. --display-fps 30)")
     parser.add_argument("--no-display", action="store_true",
-                       help="Disable real-time display completely")
+                       help="Disable web display completely")
     parser.add_argument("--dry-run", action="store_true",
                        help="Do not call LLM, just log/save")
     parser.add_argument("--llm-workers", type=int, default=4,

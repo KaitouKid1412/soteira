@@ -215,7 +215,7 @@ class LLMSink:
     def __init__(self, user_query: str, openai_api_key: Optional[str] = None, 
                  dry_run: bool = False, max_queue_size: int = 100, num_workers: int = 4,
                  similarity_threshold: float = 0.90, debug_mode: bool = False,
-                 mode: str = "summary"):
+                 mode: str = "summary", web_display=None):
         """
         Initialize LLM sink.
         
@@ -236,6 +236,7 @@ class LLMSink:
         self.similarity_threshold = similarity_threshold
         self.debug_mode = debug_mode
         self.mode = mode
+        self.web_display = web_display
         
         # Response collection for summary mode
         self.collected_responses = []  # List of (timestamp, image_path, response_content)
@@ -252,6 +253,9 @@ class LLMSink:
             'skipped_similar': 0,
             'sent_to_llm': 0
         }
+        
+        # Thread-safe lock for similarity feature updates
+        self.similarity_lock = threading.Lock()
         self.num_workers = num_workers
         
         # Initialize prompt transformer
@@ -345,6 +349,15 @@ class LLMSink:
                 
                 if self.debug_mode:
                     print(f"[LLM-{worker_id}] Processing request for: {image_path}")
+                
+                # Check similarity and skip if too similar to previous images
+                if not self._check_similarity_and_add(image_path, frame_data):
+                    # Image too similar, skip processing
+                    self.request_queue.task_done()
+                    continue
+                
+                # Log that image was sent to LLM (for tracking purposes)
+                self._log_sent_image(image_path, frame_data)
                 
                 # Check for rate limiting backoff
                 with self.rate_limit_lock:
@@ -729,7 +742,8 @@ The user appears to be engaged in {', '.join(unique_activities[:3]) if unique_ac
                     self.alert_count += 1
                     print(f"\n🚨 ALERT TRIGGERED! ({self.alert_count})")
                     print(f"📷 Image: {Path(image_path).name}")
-                    print(f"🔍 Analysis: {parsed_response.get('description', parsed_response.get('analysis', 'No description'))}")
+                    analysis_text = parsed_response.get('description', parsed_response.get('analysis', 'No description'))
+                    print(f"🔍 Analysis: {analysis_text}")
                     if 'items_found' in parsed_response:
                         print(f"🎯 Items: {parsed_response['items_found']}")
                     if 'items' in parsed_response:
@@ -737,6 +751,20 @@ The user appears to be engaged in {', '.join(unique_activities[:3]) if unique_ac
                     confidence = parsed_response.get('confidence', 'N/A')
                     print(f"📊 Confidence: {confidence}")
                     print("=" * 60)
+                    
+                    # Send notification to web display
+                    print(f"[LLM DEBUG] Checking web_display: {self.web_display} (type: {type(self.web_display)})")
+                    if self.web_display:
+                        notification_message = f"{analysis_text}"
+                        if 'items_found' in parsed_response and parsed_response['items_found']:
+                            notification_message += f" | Items: {parsed_response['items_found']}"
+                        elif 'items' in parsed_response and parsed_response['items']:
+                            notification_message += f" | Items: {parsed_response['items']}"
+                        if confidence != 'N/A':
+                            notification_message += f" | Confidence: {confidence}"
+                        print(f"[LLM DEBUG] Calling web_display.add_notification with: {notification_message}")
+                        self.web_display.add_notification(notification_message)
+                        print(f"[LLM DEBUG] Notification sent successfully")
                     
             elif self.mode == "summary":
                 # Collect responses for summary
@@ -843,7 +871,7 @@ The user appears to be engaged in {', '.join(unique_activities[:3]) if unique_ac
     
     def enqueue_to_llm(self, prompt, image_path, frame_data=None):
         """
-        Enqueue an LLM request for background processing with similarity deduplication.
+        Enqueue an LLM request for background processing. Similarity checking moved to worker threads.
         
         Args:
             prompt: Text prompt to send
@@ -851,7 +879,7 @@ The user appears to be engaged in {', '.join(unique_activities[:3]) if unique_ac
             frame_data: Optional cv2 image array (to avoid race condition with file I/O)
             
         Returns:
-            bool: True if successfully queued, False if queue is full or image too similar
+            bool: True if successfully queued, False if queue is full
         """
         self.similarity_stats['total_requested'] += 1
         
@@ -859,47 +887,56 @@ The user appears to be engaged in {', '.join(unique_activities[:3]) if unique_ac
         if self.debug_mode and self.similarity_stats['total_requested'] <= 5:
             print(f"[DEBUG] enqueue_to_llm called #{self.similarity_stats['total_requested']}: {image_path}")
         
-        # Extract features from new image (use frame_data if available to avoid race condition)
+        # Similarity checking moved to worker threads for better performance
+        
+        try:
+            # Queue immediately - similarity checking happens in worker threads
+            self.request_queue.put((prompt, image_path, frame_data), block=False)
+            
+            if self.debug_mode and self.similarity_stats['total_requested'] <= 3:
+                print(f"[DEBUG] Successfully queued #{self.similarity_stats['total_requested']}: {image_path}")
+            
+            return True
+            
+        except queue.Full:
+            print(f"[LLM] Queue full, dropping request for {image_path}")
+            return False
+    
+    def _check_similarity_and_add(self, image_path, frame_data):
+        """
+        Check similarity against previously sent images and add to history if unique.
+        This runs in worker threads to avoid blocking main video processing.
+        
+        Args:
+            image_path: Path to image file
+            frame_data: Optional cv2 image array
+            
+        Returns:
+            bool: True if image is unique enough to process, False if too similar
+        """
+        # Extract features from new image
         image_source = frame_data if frame_data is not None else image_path
         new_features = extract_image_features_fast(image_source)
         
-        # DEBUG: Check if features are valid
-        if self.debug_mode and self.similarity_stats['total_requested'] <= 3:
-            print(f"[DEBUG] Features extracted: shape={new_features.shape}, min={new_features.min():.3f}, max={new_features.max():.3f}, norm={np.linalg.norm(new_features):.3f}")
-        
-        # Check similarity against ALL previously sent images
-        if len(self.sent_image_features) > 0:
-            # DEBUG: Always print for first few comparisons
-            if self.debug_mode and self.similarity_stats['total_requested'] <= 5:
-                print(f"[DEBUG] Comparing against {len(self.sent_image_features)} previous images")
+        # Thread-safe similarity checking
+        with self.similarity_lock:
+            # Check similarity against ALL previously sent images
+            if len(self.sent_image_features) > 0:
+                # Calculate similarities to all previous images
+                similarities = [np.dot(new_features, prev_features) for prev_features in self.sent_image_features]
+                max_similarity = max(similarities)
+                
+                if self.debug_mode and self.similarity_stats['sent_to_llm'] <= 10:
+                    print(f"[WORKER] Max similarity: {max_similarity:.4f}, threshold: {self.similarity_threshold}")
+                
+                if max_similarity > self.similarity_threshold:
+                    self.similarity_stats['skipped_similar'] += 1
+                    similar_idx = similarities.index(max_similarity)
+                    if self.debug_mode:
+                        print(f"[WORKER] SKIPPED: Image too similar ({max_similarity:.3f} > {self.similarity_threshold}) to image #{similar_idx+1} - {image_path}")
+                    return False
             
-            # Calculate similarities to all previous images (vectorized for speed)
-            similarities = [np.dot(new_features, prev_features) for prev_features in self.sent_image_features]
-            max_similarity = max(similarities)
-            
-            # DEBUG: Always show first few similarity checks
-            if self.debug_mode and self.similarity_stats['total_requested'] <= 10:
-                print(f"[DEBUG] #{self.similarity_stats['total_requested']} Max similarity: {max_similarity:.4f}, threshold: {self.similarity_threshold}")
-                if len(similarities) >= 3:
-                    print(f"[DEBUG] Top 3 similarities: {sorted(similarities, reverse=True)[:3]}")
-            
-            if max_similarity > self.similarity_threshold:
-                self.similarity_stats['skipped_similar'] += 1
-                similar_idx = similarities.index(max_similarity)
-                if self.debug_mode:
-                    print(f"[LLM] SKIPPED: Image too similar ({max_similarity:.3f} > {self.similarity_threshold}) to image #{similar_idx+1} - {image_path}")
-                return False
-        else:
-            # DEBUG: First image
-            if self.debug_mode and self.similarity_stats['total_requested'] == 1:
-                print(f"[DEBUG] First image - no previous images to compare against")
-        
-        try:
-            # Image is unique enough, queue for LLM processing
-            # Store prompt, image_path, and frame_data (for race condition safety)
-            self.request_queue.put((prompt, image_path, frame_data), block=False)
-            
-            # Add to sent image history (maintain sliding window)
+            # Image is unique enough - add to history
             self.sent_image_features.append(new_features)
             
             # Keep only the most recent images (to prevent memory issues)
@@ -909,17 +946,9 @@ The user appears to be engaged in {', '.join(unique_activities[:3]) if unique_ac
             self.similarity_stats['sent_to_llm'] += 1
             
             if self.debug_mode:
-                print(f"[LLM] QUEUED: Image accepted for processing ({self.similarity_stats['sent_to_llm']}/{self.similarity_stats['total_requested']} sent)")
-                print(f"[LLM] ✓ SENDING TO LLM: {image_path}")
-            
-            # Optional: Save copy of LLM-sent images to separate directory for review
-            self._log_sent_image(image_path, frame_data)
+                print(f"[WORKER] ACCEPTED: Image unique enough for processing ({self.similarity_stats['sent_to_llm']}/{self.similarity_stats['total_requested']})")
             
             return True
-            
-        except queue.Full:
-            print(f"[LLM] Queue full, dropping request for {image_path}")
-            return False
     
     def get_queue_size(self):
         """Get current queue size."""
