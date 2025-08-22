@@ -127,7 +127,7 @@ class VideoAnalysisServer:
             "restaurant.mov": ProcessingConfig(
                 video_path="videos/restaurant.mov",
                 mode="alert",
-                prompt="Alert me whenever you see meat in the video ?",
+                prompt="Alert me whenever there is a food safety standard violation in the video",
                 motion_thresh=0.2,
                 conf=0.7,
                 imgsz=256,
@@ -155,9 +155,9 @@ class VideoAnalysisServer:
                 stop_on_good_frame=True
             ),
             "movie": ProcessingConfig(
-                video_path="movie.mp4",
+                video_path="videos/movie.mp4",
                 mode="alert",
-                prompt="Alert me whenever a person performs any action in the video, descibe every in detail.",
+                prompt="You are an expert movie narrator. You are being sent a sequence of deduplicated frames from a movie in real time. Your job is to narrate what's happening on screen as if telling a story, adding context from previous frames to make it cohesive and engaging.\nInstructions:\nContext Awareness: Maintain a running understanding of previous frames to narrate the story naturally, even if the current frame has minimal change.\nNo Repetition: Do not restate things already clearly described earlier unless they have meaningfully changed or progressed.\nNarrative Focus: Prioritize describing character actions, emotions, setting changes, and plot developments over static details.\nConciseness: Be vivid but efficient, avoiding redundant or filler text.\nStorytelling Tone: Make it sound like a smooth narration for a movie audience, not a frame-by-frame commentary.\nReal-Time Adaptation: Assume frames may skip minor transitions—fill small gaps logically, maintaining narrative flow.\nNo Guesswork: Avoid inventing details not supported by visual evidence, but infer obvious next actions (e.g., someone raising a hand to knock).\nContinuity Memory: Remember character names, locations, and scene context from earlier frames for seamless narration.\nIgnore Deduplication Artifacts: If a frame looks similar to a previous one, briefly acknowledge continuity instead of describing the same static content again.\nYour output should feel like a natural ongoing movie narration, not repetitive frame labeling.",
                 motion_thresh=0.001,
                 conf=0.3,
                 imgsz=320,
