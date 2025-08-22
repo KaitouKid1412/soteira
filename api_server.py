@@ -128,6 +128,21 @@ class VideoAnalysisServer:
                 disable_quality_filter=True,
                 skip_scene=False,  # Note: restaurant command doesn't use --skip-scene
                 stop_on_good_frame=True
+            ),
+            "phone_stream": ProcessingConfig(
+                video_path="phone",
+                mode="alert",
+                prompt="Monitor for security threats and suspicious activity",
+                motion_thresh=0.02,
+                conf=0.4,
+                imgsz=416,
+                scene_hist=0.50,
+                scene_ssim=0.45,
+                buffer_frames=5,
+                similarity_threshold=0.90,
+                disable_quality_filter=False,
+                skip_scene=False,
+                stop_on_good_frame=True
             )
         }
 
@@ -175,8 +190,8 @@ class VideoAnalysisServer:
             if self.is_processing:
                 raise HTTPException(status_code=400, detail="Processing already running")
             
-            # Validate video file exists
-            if not Path(config.video_path).exists():
+            # Validate video file exists (skip for phone stream)
+            if config.video_path != "phone" and not Path(config.video_path).exists():
                 raise HTTPException(status_code=404, detail="Video file not found")
             
             # Reset previous processing if any
@@ -247,6 +262,11 @@ class VideoAnalysisServer:
             if not self.is_processing:
                 raise HTTPException(status_code=404, detail="No active video processing")
             
+            # Check if this is a phone stream - if so, proxy from video server
+            if (self.current_config and self.current_config.video_path == "phone"):
+                return await self.proxy_phone_video_feed()
+            
+            # For non-phone sources, use the web display
             if not self.video_system or not hasattr(self.video_system, 'web_display') or not self.video_system.web_display:
                 raise HTTPException(status_code=404, detail="No web display available")
             
@@ -283,6 +303,38 @@ class VideoAnalysisServer:
                     
             except WebSocketDisconnect:
                 self.disconnect_websocket(websocket)
+    
+    async def proxy_phone_video_feed(self):
+        """Proxy video feed from the video server for phone streams."""
+        try:
+            import aiohttp
+        except ImportError:
+            raise HTTPException(status_code=500, detail="aiohttp not available for phone video streaming")
+        
+        async def generate_phone_frames():
+            try:
+                # Connect to the video server's stream endpoint
+                timeout = aiohttp.ClientTimeout(total=None, sock_read=1)
+                connector = aiohttp.TCPConnector(verify_ssl=False)
+                async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+                    while self.is_processing:
+                        try:
+                            async with session.get("https://localhost:8443/stream/frame") as response:
+                                if response.status == 200:
+                                    frame_data = await response.read()
+                                    yield (b'--frame\r\n'
+                                           b'Content-Type: image/jpeg\r\n\r\n' + frame_data + b'\r\n')
+                                else:
+                                    # No frame available, wait a bit
+                                    await asyncio.sleep(0.033)
+                        except Exception as e:
+                            print(f"[API] Phone proxy error: {e}")
+                            await asyncio.sleep(0.1)
+            except Exception as e:
+                print(f"[API] Phone proxy session error: {e}")
+        
+        return StreamingResponse(generate_phone_frames(), 
+                               media_type="multipart/x-mixed-replace; boundary=frame")
     
     async def connect_websocket(self, websocket: WebSocket):
         """Handle new WebSocket connection."""

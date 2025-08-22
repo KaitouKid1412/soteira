@@ -646,9 +646,23 @@ class VideoGatingSystem:
         source = self.args.source
         cap = None
         using_streamer = False
+        using_phone = False
+        
+        # Check if source is 'phone' - use HTTP phone capture
+        if source.lower() == 'phone':
+            from phone_http_capture import PhoneHTTPCapture
+            cap = PhoneHTTPCapture()
+            using_phone = True
+            if not cap.isOpened():
+                print("Error: Phone capture not available. Make sure video_server.py is running and phone is connected.")
+                return
+            print("Using phone stream via HTTP")
+            # Disable web display for phone streams to reduce latency - the video server handles the web streaming
+            print("[PHONE] Disabling web display for better performance - use video_server.py web interface")
+            self.enable_web_display = False
         
         # Check if source is a video file with streaming enabled
-        if hasattr(self.args, 'stream_video') and self.args.stream_video and not source.isdigit():
+        elif hasattr(self.args, 'stream_video') and self.args.stream_video and not source.isdigit():
             # Use video streamer for file input
             try:
                 speed = getattr(self.args, 'stream_speed', 1.0)
@@ -663,7 +677,7 @@ class VideoGatingSystem:
                 cap = None
         
         # Fallback to regular video capture
-        if cap is None:
+        if cap is None and not using_phone:
             if source.isdigit():
                 source = int(source)
             cap = cv2.VideoCapture(source)
@@ -756,6 +770,12 @@ class VideoGatingSystem:
                 stats = cap.get_stats()
                 print(f"\n[STREAMER] Final stats: {stats['frames_streamed']} frames, "
                       f"{stats['actual_fps']:.1f} FPS avg")
+            elif using_phone:
+                # Show phone capture stats
+                stats = cap.get_stats()
+                print(f"\n[PHONE] Final stats: {stats.get('frames_read_http', 0)} received, "
+                      f"{stats.get('frames_dropped', 0)} dropped, {stats.get('frames_read_http', 0)} processed")
+            
             cap.release()
             
             # Generate summary before cleanup if in summary mode
@@ -926,7 +946,7 @@ def main():
     )
     
     parser.add_argument("--source", type=str, default="0",
-                       help="Webcam index, file path, or RTSP URL")
+                       help="Webcam index, file path, RTSP URL, or 'phone' for WebRTC phone stream")
     parser.add_argument("--stream-video", action="store_true",
                        help="Stream video file at real-time frame rate (for video files only)")
     parser.add_argument("--stream-speed", type=float, default=1.0,

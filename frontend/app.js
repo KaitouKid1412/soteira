@@ -94,7 +94,13 @@ class SoteiraApp {
         this.promptText.value = preset.prompt;
 
         this.updateModeDisplay(preset.mode);
-        this.showNotification(`Loaded ${presetName} preset!`, 'success');
+        
+        // Show specific notification for phone stream
+        if (preset.video_path === 'phone') {
+            this.showNotification(`Loaded ${presetName} preset! Make sure video_server.py is running for phone streaming.`, 'success');
+        } else {
+            this.showNotification(`Loaded ${presetName} preset!`, 'success');
+        }
     }
 
     async startProcessing() {
@@ -108,13 +114,18 @@ class SoteiraApp {
 
         // Validation
         if (!config.video_path) {
-            this.showNotification('Please enter a video file path', 'error');
+            this.showNotification('Please enter a video source (file path or "phone")', 'error');
             return;
         }
 
         if (!config.prompt) {
             this.showNotification('Please enter an analysis prompt', 'error');
             return;
+        }
+        
+        // Special handling for phone streams
+        if (config.video_path === 'phone') {
+            this.showNotification('Starting phone stream analysis. Ensure video_server.py is running!', 'info');
         }
 
         try {
@@ -143,7 +154,11 @@ class SoteiraApp {
                     this.showSummaryLoader();
                 }
                 
-                this.showNotification('Video analysis started successfully!', 'success');
+                if (config.video_path === 'phone') {
+                    this.showNotification('Phone stream analysis started! Connect your phone to the video server.', 'success');
+                } else {
+                    this.showNotification('Video analysis started successfully!', 'success');
+                }
                 
                 // Start trying to load video stream after a short delay
                 setTimeout(() => {
@@ -214,13 +229,36 @@ class SoteiraApp {
 
     updateVideoStream() {
         if (this.isProcessing) {
-            this.videoStream.src = `/video_feed?t=${Date.now()}`;
+            // Add cache busting and faster refresh for phone streams
+            const timestamp = Date.now();
+            this.videoStream.src = `/video_feed?t=${timestamp}`;
+            
             this.videoStream.onload = () => {
                 this.showVideoStream();
+                // Refresh video stream more frequently for phone streams
+                if (this.videoPath.value === 'phone') {
+                    setTimeout(() => {
+                        if (this.isProcessing) {
+                            this.updateVideoStream();
+                        }
+                    }, 100); // Refresh every 100ms for phone streams
+                } else {
+                    setTimeout(() => {
+                        if (this.isProcessing) {
+                            this.updateVideoStream();
+                        }
+                    }, 1000); // Normal refresh for other sources
+                }
             };
+            
             this.videoStream.onerror = () => {
-                // Keep showing loader if video fails to load
+                // Keep showing loader if video fails to load, retry faster
                 console.log('Video stream not ready yet, keeping loader...');
+                setTimeout(() => {
+                    if (this.isProcessing) {
+                        this.updateVideoStream();
+                    }
+                }, 500);
             };
         }
     }

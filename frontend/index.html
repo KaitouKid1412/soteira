@@ -437,14 +437,18 @@
                         <option value="baby.mov">🏠 Indoor Low Activity</option>
                         <option value="desktop.mov">🖥️ Screen Sharing</option>
                         <option value="restaurant.mov">🏢 Indoor High Activity</option>
+                        <option value="phone_stream">📱 Phone Stream (WebRTC)</option>
                     </select>
                 </div>
 
                 <div class="control-group">
-                    <label for="videoPath">Video File Path:</label>
+                    <label for="videoPath">Video Source:</label>
                     <input type="text" id="videoPath" class="form-control" 
-                           placeholder="videos/baby.mov"
+                           placeholder="videos/baby.mov or 'phone' for WebRTC"
                            value="videos/baby.mov">
+                    <small style="color: #888; font-size: 0.8rem; margin-top: 0.3rem; display: block;">
+                        Enter a video file path or 'phone' to stream from your mobile device via WebRTC
+                    </small>
                 </div>
 
                 <div class="control-group">
