@@ -95,7 +95,7 @@ class VideoAnalysisServer:
                 scene_hist=0.7,  # Default since --skip-scene is True
                 scene_ssim=0.85,  # Default since --skip-scene is True  
                 buffer_frames=3,
-                similarity_threshold=0.975,
+                similarity_threshold=0.75,  # Optimized for speed
                 disable_quality_filter=True,
                 skip_scene=True
             ),
@@ -109,7 +109,7 @@ class VideoAnalysisServer:
                 scene_hist=0.7,  # Default since --skip-scene is True
                 scene_ssim=0.85,  # Default since --skip-scene is True
                 buffer_frames=3,
-                similarity_threshold=0.975,
+                similarity_threshold=0.75,  # Optimized for speed
                 disable_quality_filter=True,
                 skip_scene=True,
                 stop_on_good_frame=True
@@ -124,7 +124,7 @@ class VideoAnalysisServer:
                 scene_hist=0.05,
                 scene_ssim=0.05,
                 buffer_frames=5,
-                similarity_threshold=0.975,  # Default since not specified in command
+                similarity_threshold=0.75,  # Optimized for speed  # Default since not specified in command
                 disable_quality_filter=True,
                 skip_scene=False,  # Note: restaurant command doesn't use --skip-scene
                 stop_on_good_frame=True
@@ -139,7 +139,7 @@ class VideoAnalysisServer:
                 scene_hist=0.50,
                 scene_ssim=0.45,
                 buffer_frames=5,
-                similarity_threshold=0.90,
+                similarity_threshold=0.75,  # Optimized for speed
                 disable_quality_filter=False,
                 skip_scene=False,
                 stop_on_good_frame=True
@@ -422,7 +422,7 @@ class VideoAnalysisServer:
                 no_display=False,
                 
                 # LLM processing
-                llm_workers=2,
+                llm_workers=8,  # Increased for better real-time performance
                 similarity_threshold=self.current_config.similarity_threshold,
                 mode=self.current_config.mode,
                 

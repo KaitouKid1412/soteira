@@ -33,15 +33,15 @@ def extract_image_features_fast(image_source) -> np.ndarray:
         if isinstance(image_source, str):
             img = cv2.imread(image_source)
             if img is None:
-                return np.zeros(64)  # Much smaller fallback
+                return np.zeros(36)  # Ultra small for speed  # Much smaller fallback
         else:
             # Assume it's already a cv2 image array
             img = image_source
             if img is None or img.size == 0:
-                return np.zeros(64)
+                return np.zeros(36)  # Ultra small for speed
         
-        # Super small resize for speed (8x8 = 64 pixels)
-        img_tiny = cv2.resize(img, (8, 8))
+        # Ultra small resize for maximum speed (6x6 = 36 pixels)
+        img_tiny = cv2.resize(img, (6, 6))
         
         # Convert to grayscale for speed
         img_gray = cv2.cvtColor(img_tiny, cv2.COLOR_BGR2GRAY)
@@ -58,31 +58,53 @@ def extract_image_features_fast(image_source) -> np.ndarray:
         return features
         
     except Exception as e:
-        return np.zeros(64)
+        return np.zeros(36)  # Ultra small for speed
 
 
-def encode_image_to_base64(image_source) -> str:
-    """Encode image to base64 for OpenAI API.
+def encode_image_to_base64(image_source, max_size: int = 512, quality: int = 75) -> str:
+    """Encode image to base64 for OpenAI API with compression and resizing.
     
     Args:
         image_source: Either file path (str) or cv2 image array (numpy.ndarray)
+        max_size: Maximum dimension (width or height) for resizing
+        quality: JPEG compression quality (1-100, lower = smaller file)
     """
+    import cv2
+    
+    # Load image
     if isinstance(image_source, str):
         # File path provided
-        with open(image_source, "rb") as image_file:
-            return base64.b64encode(image_file.read()).decode('utf-8')
+        img = cv2.imread(image_source)
+        if img is None:
+            raise Exception(f"Failed to load image from {image_source}")
     else:
         # Numpy array provided (cv2 image)
-        import cv2
-        # Encode image to JPEG in memory
-        success, buffer = cv2.imencode('.jpg', image_source)
-        if not success:
-            raise Exception("Failed to encode image to JPEG")
-        return base64.b64encode(buffer).decode('utf-8')
+        img = image_source
+        if img is None:
+            raise Exception("Invalid image array provided")
+    
+    # Resize image if too large (for faster API processing)
+    height, width = img.shape[:2]
+    if max(height, width) > max_size:
+        if height > width:
+            new_height = max_size
+            new_width = int(width * (max_size / height))
+        else:
+            new_width = max_size
+            new_height = int(height * (max_size / width))
+        img = cv2.resize(img, (new_width, new_height), interpolation=cv2.INTER_AREA)
+    
+    # Encode with compression
+    encode_params = [cv2.IMWRITE_JPEG_QUALITY, quality]
+    success, buffer = cv2.imencode('.jpg', img, encode_params)
+    if not success:
+        raise Exception("Failed to encode image to JPEG")
+    
+    return base64.b64encode(buffer).decode('utf-8')
 
 
 def send_to_openai_vision(prompt: str, image_source, api_key: str, 
-                         model: str = "gpt-4o") -> dict:
+                         model: str = "gpt-4o", use_fast_model: bool = False) -> dict:
     """
     Send image and prompt to OpenAI GPT-4 Vision API.
     
@@ -96,11 +118,19 @@ def send_to_openai_vision(prompt: str, image_source, api_key: str,
         API response dict
     """
     try:
-        # Encode image
-        base64_image = encode_image_to_base64(image_source)
+        # Encode image with optimization for speed
+        base64_image = encode_image_to_base64(image_source, max_size=512, quality=75)
         
-        # Initialize OpenAI client
-        client = openai.OpenAI(api_key=api_key)
+        # Use faster model for high-load scenarios
+        if use_fast_model:
+            model = "gpt-4o-mini"  # Faster, cheaper alternative
+        
+        # Initialize OpenAI client with connection pooling and optimizations
+        client = openai.OpenAI(
+            api_key=api_key,
+            timeout=10.0,  # Reduced timeout for faster failure detection
+            max_retries=2   # Reduced retries for speed
+        )
         
         # Prepare payload
         response = client.chat.completions.create(
@@ -119,8 +149,8 @@ def send_to_openai_vision(prompt: str, image_source, api_key: str,
                     ]
                 }
             ],
-            max_tokens=500,
-            temperature=0.1  # Low temperature for consistent analysis
+            max_tokens=150,  # Reduced for faster responses
+            temperature=0.0  # Zero temperature for fastest, most consistent responses
         )
         
         # Convert to dict format
@@ -213,8 +243,8 @@ class LLMSink:
     """Background processor for LLM API calls with parallel processing and rate limit handling."""
     
     def __init__(self, user_query: str, openai_api_key: Optional[str] = None, 
-                 dry_run: bool = False, max_queue_size: int = 100, num_workers: int = 4,
-                 similarity_threshold: float = 0.90, debug_mode: bool = False,
+                 dry_run: bool = False, max_queue_size: int = 200, num_workers: int = 8,
+                 similarity_threshold: float = 0.75, debug_mode: bool = False,
                  mode: str = "summary", web_display=None):
         """
         Initialize LLM sink.
@@ -223,9 +253,9 @@ class LLMSink:
             user_query: Original user query (e.g., "find humans", "check for cigarettes")
             openai_api_key: OpenAI API key (None for stub mode)
             dry_run: If True, don't actually call LLM (just log)
-            max_queue_size: Maximum number of queued requests
-            num_workers: Number of parallel worker threads
-            similarity_threshold: Cosine similarity threshold (0.9 = 90% similar = skip)
+            max_queue_size: Maximum number of queued requests (increased for better throughput)
+            num_workers: Number of parallel worker threads (optimized for real-time processing)
+            similarity_threshold: Cosine similarity threshold (0.75 = 75% similar = skip, optimized for speed)
             debug_mode: Enable verbose debug logging
             mode: Processing mode ('summary' or 'alert')
         """
@@ -248,6 +278,14 @@ class LLMSink:
         # Image similarity tracking - maintain history of sent images
         self.sent_image_features = []  # List of all sent image features
         self.max_history_size = 100    # Keep last 100 sent images for comparison
+        
+        # Temporal deduplication - skip frames too close in time
+        self.last_sent_timestamp = 0.0  # Timestamp of last sent frame
+        self.temporal_threshold_ms = 500  # Minimum time between frames (ms)
+        
+        # Motion-based prioritization
+        self.motion_threshold_high = 0.1   # High motion threshold for priority
+        self.motion_threshold_low = 0.02   # Low motion threshold for skipping
         self.similarity_stats = {
             'total_requested': 0,
             'skipped_similar': 0,
@@ -286,6 +324,10 @@ class LLMSink:
         self.rate_limit_backoff = 0  # Seconds to wait due to rate limiting
         self.last_rate_limit = 0     # Timestamp of last rate limit
         self.rate_limit_lock = threading.Lock()
+        
+        # Model fallback for high load scenarios
+        self.queue_high_threshold = max_queue_size * 0.8  # 80% full = use fast model
+        self.use_fast_model_fallback = True
         
         # Statistics
         self.requests_processed = 0
@@ -385,9 +427,14 @@ class LLMSink:
                         
                         response = send_to_gpt_stub(self.image_prompt, image_path)
                     else:
-                        # Use real API or stub based on setup
+                        # Use real API or stub based on setup with smart model selection
                         if self.use_real_api and self.openai_api_key:
-                            response = self._call_openai_with_retry(image_path, frame_data, worker_id)
+                            # Check if we should use fast model due to high queue load
+                            current_queue_size = self.get_queue_size()
+                            use_fast = self.use_fast_model_fallback and current_queue_size > self.queue_high_threshold
+                            if use_fast and self.debug_mode:
+                                print(f"[FAST_MODEL] Using gpt-4o-mini due to high queue ({current_queue_size}/{self.max_queue_size})")
+                            response = self._call_openai_with_retry(image_path, frame_data, worker_id, use_fast_model=use_fast)
                         else:
                             response = send_to_gpt_stub(self.image_prompt, image_path)
                     
@@ -413,7 +460,7 @@ class LLMSink:
                 print(f"[LLM-{worker_id}] Worker loop error: {e}")
                 time.sleep(0.1)
     
-    def _call_openai_with_retry(self, image_path: str, frame_data, worker_id: int, max_retries: int = 3) -> dict:
+    def _call_openai_with_retry(self, image_path: str, frame_data, worker_id: int, max_retries: int = 2, use_fast_model: bool = False) -> dict:
         """Call OpenAI API with retry logic for rate limiting.
         
         Args:
@@ -421,6 +468,7 @@ class LLMSink:
             frame_data: Image data as numpy array (preferred) or None to use file path
             worker_id: Worker thread ID for logging
             max_retries: Maximum number of retries
+            use_fast_model: Whether to use faster gpt-4o-mini model for speed
             
         Returns:
             dict: API response
@@ -429,7 +477,7 @@ class LLMSink:
             try:
                 # Use frame_data if available, otherwise fall back to image_path
                 image_source = frame_data if frame_data is not None else image_path
-                response = send_to_openai_vision(self.image_prompt, image_source, self.openai_api_key)
+                response = send_to_openai_vision(self.image_prompt, image_source, self.openai_api_key, use_fast_model=use_fast_model)
                 return response
                 
             except Exception as e:
@@ -439,8 +487,8 @@ class LLMSink:
                 if "rate limit" in error_str or "quota" in error_str or "429" in error_str:
                     self.requests_rate_limited += 1
                     
-                    # Extract wait time from error if possible, otherwise use exponential backoff
-                    wait_time = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s
+                    # Extract wait time from error if possible, otherwise use faster backoff
+                    wait_time = min(1.0 + (attempt * 0.5), 3.0)  # Linear backoff: 1.5s, 2s, 2.5s (max 3s)
                     
                     # Try to extract wait time from error message
                     if "try again in" in error_str:
@@ -587,15 +635,19 @@ Respond in a natural, conversational way as if answering the user directly."""
             # Call LLM for synthesis (if available)
             if self.use_real_api and self.openai_api_key and not self.dry_run:
                 try:
-                    client = openai.OpenAI(api_key=self.openai_api_key)
+                    client = openai.OpenAI(
+                        api_key=self.openai_api_key,
+                        timeout=10.0,  # Faster timeout for synthesis
+                        max_retries=1   # Single retry for synthesis to maintain speed
+                    )
                     response = client.chat.completions.create(
                         model="gpt-4",  # Use GPT-4 for better synthesis
                         messages=[
                             {"role": "system", "content": "You are a helpful video analysis assistant that synthesizes multiple frame observations into coherent answers."},
                             {"role": "user", "content": synthesis_prompt}
                         ],
-                        max_tokens=500,
-                        temperature=0.1
+                        max_tokens=200,  # Slightly higher for synthesis but still optimized
+                        temperature=0.0
                     )
                     
                     synthesis_answer = response.choices[0].message.content.strip()
@@ -869,19 +921,46 @@ The user appears to be engaged in {', '.join(unique_activities[:3]) if unique_ac
         except Exception as e:
             print(f"[LLM] Error logging sent image: {e}")
     
-    def enqueue_to_llm(self, prompt, image_path, frame_data=None):
+    def enqueue_to_llm(self, prompt, image_path, frame_data=None, motion_ratio=None):
         """
-        Enqueue an LLM request for background processing. Similarity checking moved to worker threads.
+        Enqueue an LLM request for background processing with smart prioritization.
         
         Args:
             prompt: Text prompt to send
             image_path: Path to image file
             frame_data: Optional cv2 image array (to avoid race condition with file I/O)
+            motion_ratio: Optional motion ratio for prioritization (0.0-1.0)
             
         Returns:
-            bool: True if successfully queued, False if queue is full
+            bool: True if successfully queued, False if dropped (queue full, temporal skip, or low priority)
         """
         self.similarity_stats['total_requested'] += 1
+        
+        # Smart motion-based filtering
+        if motion_ratio is not None:
+            # Skip very low motion frames to reduce processing load
+            if motion_ratio < self.motion_threshold_low:
+                if self.debug_mode and self.similarity_stats['total_requested'] <= 10:
+                    print(f"[MOTION] Skipped low motion frame ({motion_ratio:.3f} < {self.motion_threshold_low})")
+                return False
+            
+            # For high motion frames, reduce temporal threshold for more responsive processing
+            temporal_threshold = self.temporal_threshold_ms
+            if motion_ratio > self.motion_threshold_high:
+                temporal_threshold = max(250, self.temporal_threshold_ms // 2)  # Half the time for high motion
+        else:
+            temporal_threshold = self.temporal_threshold_ms
+        
+        # Temporal deduplication - skip frames too close in time
+        current_time = time.time() * 1000  # Convert to milliseconds
+        if current_time - self.last_sent_timestamp < temporal_threshold:
+            if self.debug_mode and self.similarity_stats['total_requested'] <= 10:
+                time_diff = current_time - self.last_sent_timestamp
+                print(f"[TEMPORAL] Skipped frame - too soon ({time_diff:.0f}ms < {temporal_threshold:.0f}ms)")
+            return False
+        
+        # Update timestamp for temporal tracking
+        self.last_sent_timestamp = current_time
         
         # DEBUG: Always print first few calls
         if self.debug_mode and self.similarity_stats['total_requested'] <= 5:

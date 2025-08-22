@@ -328,8 +328,11 @@ class VideoGatingSystem:
                                  changed_ratio=self.current_changed_ratio)
                     
                     # Enqueue to LLM (dry-run is handled inside LLM sink)
-                    # Pass frame data to avoid race condition with async file saving
-                    llm_queued = self.llm_sink.enqueue_to_llm(self.args.prompt, path, best_frame)
+                    # Pass frame data and motion info for smart prioritization
+                    llm_queued = self.llm_sink.enqueue_to_llm(
+                        self.args.prompt, path, best_frame, 
+                        motion_ratio=getattr(self, 'current_changed_ratio', 0.0)
+                    )
                     
                     # Record LLM event (only count as sent if actually queued)
                     self.perf_tracker.record_llm_event(llm_queued, self.llm_sink.get_queue_size())
@@ -1018,10 +1021,10 @@ def main():
                        help="Disable web display completely")
     parser.add_argument("--dry-run", action="store_true",
                        help="Do not call LLM, just log/save")
-    parser.add_argument("--llm-workers", type=int, default=4,
-                       help="Number of parallel LLM worker threads (default: 4)")
-    parser.add_argument("--similarity-threshold", type=float, default=0.90,
-                       help="Image similarity threshold for deduplication (0.9 = 90% similar = skip)")
+    parser.add_argument("--llm-workers", type=int, default=8,
+                       help="Number of parallel LLM worker threads (default: 8, optimized for real-time)")
+    parser.add_argument("--similarity-threshold", type=float, default=0.75,
+                       help="Image similarity threshold for deduplication (0.75 = 75% similar = skip, optimized for speed)")
     parser.add_argument("--mode", type=str, choices=["summary", "alert"], default="summary",
                        help="Processing mode: 'summary' (combine all responses) or 'alert' (check each response for alerts)")
     parser.add_argument("--debug", action="store_true",
