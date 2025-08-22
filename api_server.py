@@ -128,6 +128,21 @@ class VideoAnalysisServer:
                 disable_quality_filter=True,
                 skip_scene=False,  # Note: restaurant command doesn't use --skip-scene
                 stop_on_good_frame=True
+            ),
+            "webcam": ProcessingConfig(
+                video_path="0",  # Use camera device 0 (default laptop webcam)
+                mode="alert",
+                prompt="Alert me if there's any suspicious activity or security concerns",
+                motion_thresh=0.005,
+                conf=0.6,
+                imgsz=256,
+                scene_hist=0.05,
+                scene_ssim=0.05,
+                buffer_frames=5,
+                similarity_threshold=0.85,
+                disable_quality_filter=True,
+                skip_scene=False,
+                stop_on_good_frame=True
             )
         }
 
@@ -175,8 +190,8 @@ class VideoAnalysisServer:
             if self.is_processing:
                 raise HTTPException(status_code=400, detail="Processing already running")
             
-            # Validate video file exists
-            if not Path(config.video_path).exists():
+            # Validate video file exists (skip validation for webcam devices)
+            if not config.video_path.isdigit() and not Path(config.video_path).exists():
                 raise HTTPException(status_code=404, detail="Video file not found")
             
             # Reset previous processing if any
@@ -328,8 +343,8 @@ class VideoAnalysisServer:
                 save_dir="./processing_output",
                 source=self.current_config.video_path,
                 
-                # Video streaming
-                stream_video=True,
+                # Video streaming (disable for live webcam)
+                stream_video=False if self.current_config.video_path == "0" else True,
                 stream_speed=1.0,
                 stream_loop=False,
                 no_stream_loop=True,
