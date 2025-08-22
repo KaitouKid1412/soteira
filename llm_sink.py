@@ -238,10 +238,19 @@ def call_gemini_streaming(image_source, prompt: str, model, web_display=None) ->
             
         print(f"[GEMINI] Starting streaming request...")
         
-        # Start streaming generation
+        # Configure generation settings for consistent output
+        import google.generativeai as genai
+        generation_config = genai.types.GenerationConfig(
+            temperature=0.0,  # Zero temperature for consistent, reliable descriptions
+            max_output_tokens=150,  # Limit for faster streaming
+            top_p=0.8
+        )
+        
+        # Start streaming generation with config
         response_stream = model.generate_content(
             [prompt, image],
-            stream=True
+            stream=True,
+            generation_config=generation_config
         )
         
         # Accumulate full response and stream tokens

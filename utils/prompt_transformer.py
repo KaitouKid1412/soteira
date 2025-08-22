@@ -109,7 +109,7 @@ Response: {"image_prompt": "Describe the office activity in this image. Respond 
                     {"role": "user", "content": user_query}
                 ],
                 temperature=0.0,  # Zero temperature for fastest responses
-                max_tokens=200  # Reduced tokens for faster transformation
+                max_tokens=2000  # Reduced tokens for faster transformation
             )
             
             # Parse the JSON response

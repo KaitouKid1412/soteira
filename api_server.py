@@ -224,8 +224,9 @@ class VideoAnalysisServer:
                     preset_dict = preset_config.model_dump()
                     preset_dict['mode'] = config.mode  # Override with user's mode selection
                     preset_dict['prompt'] = config.prompt  # Override with user's prompt
+                    preset_dict['streaming_mode'] = config.streaming_mode  # Preserve streaming mode setting
                     config = ProcessingConfig(**preset_dict)
-                    print(f"[API] Applied preset config: skip_scene={config.skip_scene}")
+                    print(f"[API] Applied preset config: skip_scene={config.skip_scene}, streaming_mode={config.streaming_mode}")
                     break
             
             # Validate video file exists (skip for phone stream)
