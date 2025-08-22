@@ -88,7 +88,9 @@ class VideoGatingSystem:
             num_workers=args.llm_workers,
             similarity_threshold=args.similarity_threshold,
             debug_mode=getattr(args, 'debug', False),
-            mode=getattr(args, 'mode', 'summary')
+            mode=getattr(args, 'mode', 'summary'),
+            streaming_mode=getattr(args, 'streaming_mode', False),
+            gemini_api_key=getattr(args, 'gemini_api_key', None)
         )
         
         # Timing and display
@@ -1025,8 +1027,8 @@ def main():
                        help="Number of parallel LLM worker threads (default: 8, optimized for real-time)")
     parser.add_argument("--similarity-threshold", type=float, default=0.75,
                        help="Image similarity threshold for deduplication (0.75 = 75% similar = skip, optimized for speed)")
-    parser.add_argument("--mode", type=str, choices=["summary", "alert"], default="summary",
-                       help="Processing mode: 'summary' (combine all responses) or 'alert' (check each response for alerts)")
+    parser.add_argument("--mode", type=str, choices=["summary", "alert", "realtime_description"], default="summary",
+                       help="Processing mode: 'summary' (combine all responses), 'alert' (check each response for alerts), or 'realtime_description' (continuous scene descriptions for accessibility)")
     parser.add_argument("--debug", action="store_true",
                        help="Enable verbose debug logging")
     
@@ -1047,6 +1049,12 @@ def main():
                        help="Skip scene change detection gate - run object detection without scene requirement") 
     parser.add_argument("--skip-object", action="store_true",
                        help="Skip object detection gate - only save scene change frames")
+    
+    # Streaming and LLM options
+    parser.add_argument("--streaming-mode", action="store_true",
+                       help="Enable streaming mode with Gemini Flash 2.5 for real-time token delivery")
+    parser.add_argument("--gemini-api-key", type=str,
+                       help="Google Gemini API key for streaming mode")
     
     args = parser.parse_args()
     

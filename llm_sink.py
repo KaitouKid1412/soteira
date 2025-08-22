@@ -14,6 +14,8 @@ import openai
 from typing import Optional
 import cv2
 import numpy as np
+import google.generativeai as genai
+import os
 
 from utils.prompt_transformer import LLMPromptTransformer, SimplePromptTransformer
 
@@ -149,7 +151,7 @@ def send_to_openai_vision(prompt: str, image_source, api_key: str,
                     ]
                 }
             ],
-            max_tokens=150,  # Reduced for faster responses
+            max_tokens=100,  # Reduced for faster, more reliable responses
             temperature=0.0  # Zero temperature for fastest, most consistent responses
         )
         
@@ -201,6 +203,120 @@ def send_to_openai_vision(prompt: str, image_source, api_key: str,
         }
 
 
+def call_gemini_streaming(image_source, prompt: str, model, web_display=None) -> dict:
+    """
+    Call Gemini Flash 2.5 with streaming support for real-time token delivery.
+    
+    Args:
+        image_source: Image file path or PIL Image
+        prompt: Text prompt for analysis
+        model: Gemini model instance
+        web_display: Display interface for streaming tokens
+        
+    Returns:
+        API response dict (accumulated from stream)
+    """
+    try:
+        # Encode image for Gemini
+        if isinstance(image_source, str):
+            # Read image file
+            import PIL.Image
+            import os
+            if not os.path.exists(image_source):
+                raise FileNotFoundError(f"Image file not found: {image_source}")
+            image = PIL.Image.open(image_source)
+        elif hasattr(image_source, 'shape'):
+            # Convert numpy array (cv2 image) to PIL Image
+            import cv2
+            import PIL.Image
+            # Convert BGR to RGB for PIL
+            rgb_image = cv2.cvtColor(image_source, cv2.COLOR_BGR2RGB)
+            image = PIL.Image.fromarray(rgb_image)
+        else:
+            # Assume it's already a PIL Image
+            image = image_source
+            
+        print(f"[GEMINI] Starting streaming request...")
+        
+        # Start streaming generation
+        response_stream = model.generate_content(
+            [prompt, image],
+            stream=True
+        )
+        
+        # Accumulate full response and stream tokens
+        full_content = ""
+        token_count = 0
+        start_time = time.time()
+        
+        for chunk in response_stream:
+            if chunk.text:
+                full_content += chunk.text
+                token_count += 1
+                
+                # Send streaming token to frontend via web_display
+                if web_display and hasattr(web_display, 'send_streaming_token'):
+                    web_display.send_streaming_token(chunk.text)
+                elif web_display:
+                    # Fallback: send token via pending queue for WebSocket
+                    if hasattr(web_display, 'server') and hasattr(web_display.server, 'pending_token_queue'):
+                        web_display.server.pending_token_queue.append({
+                            'token': chunk.text,
+                            'timestamp': time.time()
+                        })
+                        print(f"[GEMINI] Token added to queue: '{chunk.text}'")
+                    else:
+                        print(f"[GEMINI] Warning: No token queue available")
+                
+                print(f"[GEMINI] Token {token_count}: {chunk.text}", end='', flush=True)
+        
+        elapsed = time.time() - start_time
+        print(f"\n[GEMINI] ✓ Streaming complete: {token_count} tokens in {elapsed:.2f}s")
+        
+        # Return OpenAI-compatible response format
+        result = {
+            "id": f"gemini-{int(time.time())}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": "gemini-2.0-flash-exp",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": full_content
+                    },
+                    "finish_reason": "stop"
+                }
+            ],
+            "usage": {
+                "prompt_tokens": len(prompt.split()),  # Rough estimate
+                "completion_tokens": token_count,
+                "total_tokens": len(prompt.split()) + token_count
+            }
+        }
+        
+        return result
+        
+    except Exception as e:
+        print(f"[GEMINI] ✗ Streaming error: {e}")
+        return {
+            "error": str(e),
+            "id": f"gemini-error-{int(time.time())}",
+            "created": int(time.time()),
+            "model": "gemini-2.0-flash-exp",
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant", 
+                        "content": f"Error with Gemini streaming: {e}"
+                    },
+                    "finish_reason": "error"
+                }
+            ]
+        }
+
+
 def send_to_gpt_stub(prompt: str, image_path: str) -> dict:
     """
     Stub function for testing without API calls.
@@ -245,7 +361,8 @@ class LLMSink:
     def __init__(self, user_query: str, openai_api_key: Optional[str] = None, 
                  dry_run: bool = False, max_queue_size: int = 200, num_workers: int = 8,
                  similarity_threshold: float = 0.75, debug_mode: bool = False,
-                 mode: str = "summary", web_display=None):
+                 mode: str = "summary", web_display=None, streaming_mode: bool = False,
+                 gemini_api_key: Optional[str] = None):
         """
         Initialize LLM sink.
         
@@ -257,7 +374,9 @@ class LLMSink:
             num_workers: Number of parallel worker threads (optimized for real-time processing)
             similarity_threshold: Cosine similarity threshold (0.75 = 75% similar = skip, optimized for speed)
             debug_mode: Enable verbose debug logging
-            mode: Processing mode ('summary' or 'alert')
+            mode: Processing mode ('summary', 'alert', or 'realtime_description')
+            streaming_mode: Enable token streaming for real-time updates
+            gemini_api_key: Google Gemini API key for Gemini Flash 2.5
         """
         self.user_query = user_query
         self.openai_api_key = openai_api_key
@@ -267,6 +386,19 @@ class LLMSink:
         self.debug_mode = debug_mode
         self.mode = mode
         self.web_display = web_display
+        self.streaming_mode = streaming_mode
+        self.gemini_api_key = gemini_api_key
+        
+        # Initialize Gemini client if API key provided
+        self.gemini_model = None
+        if gemini_api_key:
+            try:
+                genai.configure(api_key=gemini_api_key)
+                self.gemini_model = genai.GenerativeModel('gemini-2.0-flash-exp')
+                print(f"[GEMINI] Initialized Gemini Flash 2.5 model")
+            except Exception as e:
+                print(f"[GEMINI] Failed to initialize Gemini: {e}")
+                self.gemini_model = None
         
         # Response collection for summary mode
         self.collected_responses = []  # List of (timestamp, image_path, response_content)
@@ -275,13 +407,25 @@ class LLMSink:
         # Alert tracking
         self.alert_count = 0
         
+        # Real-time description tracking
+        self.last_description_timestamp = 0.0
+        self.description_interval_ms = 3000  # 3 seconds between descriptions
+        self.last_scene_description = ""  # Store last description for context
+        
         # Image similarity tracking - maintain history of sent images
         self.sent_image_features = []  # List of all sent image features
         self.max_history_size = 100    # Keep last 100 sent images for comparison
         
         # Temporal deduplication - skip frames too close in time
         self.last_sent_timestamp = 0.0  # Timestamp of last sent frame
-        self.temporal_threshold_ms = 500  # Minimum time between frames (ms)
+        # Adjust temporal threshold based on mode and streaming
+        if mode == "realtime_description":
+            if streaming_mode:
+                self.temporal_threshold_ms = 800  # 0.8 seconds for streaming mode (much faster)
+            else:
+                self.temporal_threshold_ms = 2500  # 2.5 seconds for standard real-time descriptions
+        else:
+            self.temporal_threshold_ms = 500  # Minimum time between frames (ms)
         
         # Motion-based prioritization
         self.motion_threshold_high = 0.1   # High motion threshold for priority
@@ -427,15 +571,26 @@ class LLMSink:
                         
                         response = send_to_gpt_stub(self.image_prompt, image_path)
                     else:
-                        # Use real API or stub based on setup with smart model selection
-                        if self.use_real_api and self.openai_api_key:
-                            # Check if we should use fast model due to high queue load
+                        # Choose LLM API based on streaming mode and available keys
+                        print(f"[LLM-{worker_id}] STREAMING CHECK: streaming_mode={self.streaming_mode}, gemini_model={self.gemini_model is not None}")
+                        if self.streaming_mode and self.gemini_model:
+                            # Use Gemini Flash 2.5 for streaming
+                            print(f"[LLM-{worker_id}] ✅ Using Gemini Flash 2.5 streaming mode")
+                            # Use frame_data if available to avoid file I/O race conditions
+                            image_source = frame_data if frame_data is not None else image_path
+                            
+                            # Create a plain text prompt for streaming (no JSON format)
+                            streaming_prompt = "Describe what you see in this scene for a blind person. Keep it concise and conversational. Focus on people, objects, and activities. Respond with plain text only, no JSON format."
+                            response = call_gemini_streaming(image_source, streaming_prompt, self.gemini_model, self.web_display)
+                        elif self.use_real_api and self.openai_api_key:
+                            # Use OpenAI API with smart model selection
                             current_queue_size = self.get_queue_size()
                             use_fast = self.use_fast_model_fallback and current_queue_size > self.queue_high_threshold
                             if use_fast and self.debug_mode:
                                 print(f"[FAST_MODEL] Using gpt-4o-mini due to high queue ({current_queue_size}/{self.max_queue_size})")
                             response = self._call_openai_with_retry(image_path, frame_data, worker_id, use_fast_model=use_fast)
                         else:
+                            # Fallback to stub mode
                             response = send_to_gpt_stub(self.image_prompt, image_path)
                     
                     # Update cost tracking (only for real API calls)
@@ -540,8 +695,11 @@ class LLMSink:
         Returns:
             str: LLM-synthesized answer to the original user question
         """
-        if self.mode != "summary":
+        if self.mode not in ["summary", "realtime_description"]:
             return f"Summary not available in {self.mode} mode"
+        
+        if self.mode == "realtime_description":
+            return f"Current scene: {self.last_scene_description}" if self.last_scene_description else "No scene description available"
         
         if not self.collected_responses:
             return "No responses collected for summary"
@@ -766,15 +924,60 @@ The user appears to be engaged in {', '.join(unique_activities[:3]) if unique_ac
                 elif "```" in clean_content:
                     clean_content = clean_content.split("```")[1].strip()
                 
+                # Handle incomplete JSON by trying to complete it
+                if clean_content.startswith('{') and not clean_content.endswith('}'):
+                    # Try to find the last complete field
+                    if '"analysis"' in clean_content:
+                        # Extract the analysis content
+                        analysis_start = clean_content.find('"analysis"')
+                        analysis_content = clean_content[analysis_start:]
+                        if '":' in analysis_content:
+                            analysis_value = analysis_content.split('":')[1].strip()
+                            if analysis_value.startswith('"'):
+                                # Try to find the end of the string
+                                analysis_value = analysis_value[1:]  # Remove opening quote
+                                # Find the last quote before any truncation
+                                if '"' in analysis_value:
+                                    analysis_text = analysis_value.split('"')[0]
+                                else:
+                                    analysis_text = analysis_value.rstrip(',')
+                                
+                                # Create a valid JSON response
+                                clean_content = f'{{"analysis": "{analysis_text}", "confidence": 0.8}}'
+                
                 parsed_response = json.loads(clean_content)
                 if self.debug_mode:
                     print(f"[ALERT DEBUG] Parsed JSON successfully: {parsed_response}")
             except Exception as e:
-                # If not JSON, treat as plain text
-                parsed_response = {"raw_response": llm_content}
+                # If JSON parsing fails, try to extract analysis from raw text
+                analysis_match = None
+                if '"analysis"' in llm_content:
+                    try:
+                        # Try to extract analysis text manually
+                        analysis_part = llm_content.split('"analysis"')[1]
+                        if '":' in analysis_part:
+                            analysis_content = analysis_part.split('":')[1].strip()
+                            if analysis_content.startswith('"'):
+                                analysis_content = analysis_content[1:]
+                                # Find end of string value
+                                end_pos = analysis_content.find('",')
+                                if end_pos == -1:
+                                    end_pos = analysis_content.find('"')
+                                if end_pos > 0:
+                                    analysis_match = analysis_content[:end_pos]
+                    except:
+                        pass
+                
+                if analysis_match:
+                    parsed_response = {"analysis": analysis_match, "confidence": 0.7}
+                    print(f"[ALERT DEBUG] Extracted analysis from malformed JSON: {analysis_match[:100]}...")
+                else:
+                    # If not JSON, treat as plain text
+                    parsed_response = {"analysis": llm_content, "confidence": 0.5}
+                    
                 if self.debug_mode:
                     print(f"[ALERT DEBUG] JSON parsing failed: {e}")
-                    print(f"[ALERT DEBUG] Cleaned content was: {clean_content[:100] if 'clean_content' in locals() else 'N/A'}...")
+                    print(f"[ALERT DEBUG] Using fallback parsing")
             
             timestamp = time.time()
             
@@ -827,13 +1030,97 @@ The user appears to be engaged in {', '.join(unique_activities[:3]) if unique_ac
                         'response': parsed_response,
                         'raw_content': llm_content
                     })
+            
+            elif self.mode == "realtime_description":
+                # Real-time scene description for accessibility
+                # In this mode, we treat every description as an "alert" that should be spoken
+                if parsed_response.get('analysis'):
+                    description = parsed_response['analysis']
+                    current_time = time.time()
+                    
+                    # Intelligent scene change detection
+                    should_speak = True
+                    
+                    if self.last_scene_description:
+                        # Calculate similarity between descriptions
+                        similarity_score = self._calculate_description_similarity(
+                            description, self.last_scene_description
+                        )
+                        
+                        time_since_last = current_time - self.last_description_timestamp
+                        
+                        # Only speak if significant change or enough time has passed
+                        if similarity_score > 0.8 and time_since_last < 10:  # Very similar and recent
+                            should_speak = False
+                            print(f"[REALTIME_DESC] Skipping similar description (similarity: {similarity_score:.2f})")
+                        elif similarity_score > 0.6:  # Somewhat similar - highlight changes
+                            changes = self._extract_changes(description, self.last_scene_description)
+                            if changes:
+                                description = f"Changes: {changes}"
+                            else:
+                                should_speak = False
+                        # If similarity < 0.6, it's a significant change - speak the full new description
+                    
+                    if should_speak:
+                        # Store current description for next comparison
+                        self.last_scene_description = description
+                        self.last_description_timestamp = current_time
+                        
+                        # Create an alert-style notification for TTS
+                        # This uses the same mechanism as the alert system
+                        print(f"[REALTIME_DESC] Creating accessibility notification")
+                        print(f"[REALTIME_DESC] web_display exists: {self.web_display is not None}")
+                        print(f"[REALTIME_DESC] web_display type: {type(self.web_display)}")
+                        if self.web_display:
+                            print(f"[REALTIME_DESC] Sending description: {description}")
+                            self.web_display.add_notification(description)
+                            print(f"[REALTIME_DESC] add_notification call completed")
+                        else:
+                            print(f"[REALTIME_DESC] ERROR: web_display is None - cannot send notification!")
                     
                     if self.debug_mode:
-                        print(f"[SUMMARY] Collected response #{len(self.collected_responses)} from {Path(image_path).name}")
+                        print(f"[REALTIME_DESC] Scene description: {description}")
                         
         except Exception as e:
             if self.debug_mode:
                 print(f"[RESPONSE] Error processing response: {e}")
+    
+    def _calculate_description_similarity(self, desc1: str, desc2: str) -> float:
+        """Calculate similarity between two descriptions using simple word overlap."""
+        if not desc1 or not desc2:
+            return 0.0
+            
+        # Simple word-based similarity
+        words1 = set(desc1.lower().split())
+        words2 = set(desc2.lower().split())
+        
+        if not words1 or not words2:
+            return 0.0
+            
+        intersection = words1.intersection(words2)
+        union = words1.union(words2)
+        
+        return len(intersection) / len(union)
+    
+    def _extract_changes(self, new_desc: str, old_desc: str) -> str:
+        """Extract key differences between descriptions."""
+        if not new_desc or not old_desc:
+            return new_desc
+            
+        # Simple approach: find new key words/phrases
+        old_words = set(old_desc.lower().split())
+        new_words = set(new_desc.lower().split())
+        
+        # Find significant new words (not common words)
+        common_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'is', 'are', 'was', 'were', 'been', 'be', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should', 'may', 'might', 'can', 'this', 'that', 'these', 'those'}
+        
+        new_significant_words = (new_words - old_words) - common_words
+        
+        if new_significant_words and len(new_significant_words) <= 10:  # Reasonable number of changes
+            return f"New activity detected: {' '.join(sorted(new_significant_words))}"
+        
+        # If too many changes, return the new description
+        return new_desc
     
     def _save_analysis(self, image_path: str, response: dict):
         """

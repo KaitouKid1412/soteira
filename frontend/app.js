@@ -12,6 +12,13 @@ class SoteiraApp {
         this.alerts = [];
         this.lastAlertCheck = 0;
         
+        // Text-to-Speech for accessibility
+        this.ttsEnabled = false;
+        this.speechSynthesis = window.speechSynthesis;
+        this.currentVoice = null;
+        this.speechQueue = [];
+        this.isSpeaking = false;
+        
         this.initializeElements();
         this.setupEventListeners();
         this.connectWebSocket();
@@ -44,6 +51,26 @@ class SoteiraApp {
         this.alertsList = document.getElementById('alertsList');
         this.summaryLoading = document.getElementById('summaryLoading');
         this.summaryText = document.getElementById('summaryText');
+        
+        // TTS controls
+        this.ttsToggle = document.getElementById('ttsToggle');
+        this.speedModeToggle = document.getElementById('speedModeToggle');
+        this.voiceSelect = document.getElementById('voiceSelect');
+        this.speechRate = document.getElementById('speechRate');
+        this.speechVolume = document.getElementById('speechVolume');
+        this.testTtsBtn = document.getElementById('testTtsBtn');
+        
+        // Streaming display elements
+        this.streamingDisplay = document.getElementById('streamingDisplay');
+        this.streamingText = document.getElementById('streamingText');
+        
+        // Streaming mode state
+        this.speedModeEnabled = false;
+        this.streamingBuffer = "";
+        this.lastTokenTime = 0;
+        this.currentStreamingText = "";
+        this.streamingActive = false;
+        this.streamingHistory = [];  // Keep history of completed descriptions
     }
 
     setupEventListeners() {
@@ -67,6 +94,71 @@ class SoteiraApp {
                 }
             }, 1000);
         });
+
+        // TTS event listeners
+        if (this.ttsToggle) {
+            this.ttsToggle.addEventListener('change', (e) => {
+                this.ttsEnabled = e.target.checked;
+                if (!this.ttsEnabled) {
+                    this.stopSpeech();
+                }
+            });
+        }
+
+        if (this.speedModeToggle) {
+            this.speedModeToggle.addEventListener('change', (e) => {
+                this.speedModeEnabled = e.target.checked;
+                console.log(`[SPEED] Speed mode ${this.speedModeEnabled ? 'enabled' : 'disabled'}`);
+                
+                // Clear streaming state when toggling
+                this.streamingBuffer = "";
+                this.currentStreamingText = "";
+                this.streamingActive = false;
+                
+                // Show/hide streaming display based on mode and speed setting
+                if (this.streamingDisplay) {
+                    const showStreaming = (this.speedModeEnabled || this.analysisMode.value === 'realtime_description') && 
+                                        this.analysisMode.value === 'realtime_description';
+                    this.streamingDisplay.style.display = showStreaming ? 'block' : 'none';
+                    
+                    if (showStreaming && this.streamingText) {
+                        this.streamingText.textContent = 'Waiting for description...';
+                    }
+                }
+                
+                // Auto-enable TTS when speed mode is enabled
+                if (this.speedModeEnabled && this.ttsToggle) {
+                    this.ttsToggle.checked = true;
+                    this.ttsEnabled = true;
+                }
+            });
+        }
+
+        if (this.voiceSelect) {
+            this.voiceSelect.addEventListener('change', (e) => {
+                this.currentVoice = this.speechSynthesis.getVoices().find(v => v.name === e.target.value);
+            });
+        }
+
+        if (this.testTtsBtn) {
+            this.testTtsBtn.addEventListener('click', () => {
+                this.ttsEnabled = true; // Temporarily enable for testing
+                this.speak('Testing text to speech. You are now hearing the accessibility voice for real-time scene descriptions.');
+                
+                // Also test the alert system
+                setTimeout(() => {
+                    this.addAlert({
+                        id: 'test',
+                        timestamp: new Date().toISOString(),
+                        message: 'Test accessibility alert - this should be spoken aloud',
+                        confidence: 0.9
+                    });
+                }, 2000);
+            });
+        }
+
+        // Initialize TTS voices
+        this.initializeTTS();
     }
 
     async loadVideoPresets() {
@@ -109,7 +201,8 @@ class SoteiraApp {
         const config = {
             video_path: this.videoPath.value.trim(),
             mode: this.analysisMode.value,
-            prompt: this.promptText.value.trim()
+            prompt: this.promptText.value.trim(),
+            streaming_mode: this.speedModeEnabled || this.analysisMode.value === 'realtime_description'
         };
 
         // Validation
@@ -337,12 +430,18 @@ class SoteiraApp {
     }
 
     handleWebSocketMessage(message) {
+        console.log('[WS] Received message:', message.type, message.data);
         switch (message.type) {
             case 'status_update':
                 this.updateStats(message.data);
                 break;
             case 'new_alert':
+                console.log('[WS] Processing new alert:', message.data);
                 this.addAlert(message.data);
+                break;
+            case 'token_stream':
+                console.log('[WS] 🎯 Processing streaming token:', message.data);
+                this.handleStreamingToken(message.data);
                 break;
             default:
                 console.log('Unknown WebSocket message type:', message.type);
@@ -350,15 +449,32 @@ class SoteiraApp {
     }
 
     updateModeDisplay(mode) {
-        if (mode === 'alert') {
+        if (mode === 'alert' || mode === 'realtime_description') {
             this.alertsSection.style.display = 'block';
             this.summarySection.style.display = 'none';
+            
+            // Show streaming display for realtime_description mode
+            if (mode === 'realtime_description' && this.streamingDisplay) {
+                this.streamingDisplay.style.display = 'block';
+            }
+            
+            // Auto-enable TTS for realtime_description mode
+            if (mode === 'realtime_description' && this.ttsToggle) {
+                this.ttsToggle.checked = true;
+                this.ttsEnabled = true;
+            }
         } else if (mode === 'summary') {
             this.alertsSection.style.display = 'none';
             this.summarySection.style.display = 'block';
+            if (this.streamingDisplay) {
+                this.streamingDisplay.style.display = 'none';
+            }
         } else {
             this.alertsSection.style.display = 'none';
             this.summarySection.style.display = 'none';
+            if (this.streamingDisplay) {
+                this.streamingDisplay.style.display = 'none';
+            }
         }
     }
 
@@ -409,6 +525,9 @@ class SoteiraApp {
         this.alerts.unshift(alert); // Add to beginning
         this.renderAlerts();
         this.showNotification(`🚨 ${alert.message}`, 'alert');
+        
+        // Speak the alert if TTS is enabled
+        this.speak(alert.message);
     }
 
     renderAlerts() {
@@ -526,6 +645,237 @@ class SoteiraApp {
                 }
             }, 300);
         }, 5000);
+    }
+
+    // Text-to-Speech Methods
+    initializeTTS() {
+        if ('speechSynthesis' in window) {
+            // Load voices
+            const loadVoices = () => {
+                const voices = this.speechSynthesis.getVoices();
+                if (this.voiceSelect && voices.length > 0) {
+                    this.voiceSelect.innerHTML = voices
+                        .filter(voice => voice.lang.startsWith('en'))
+                        .map(voice => `<option value="${voice.name}">${voice.name} (${voice.lang})</option>`)
+                        .join('');
+                    
+                    // Select first English voice as default
+                    this.currentVoice = voices.find(voice => voice.lang.startsWith('en'));
+                }
+            };
+
+            loadVoices();
+            this.speechSynthesis.addEventListener('voiceschanged', loadVoices);
+        }
+    }
+
+    speak(text) {
+        console.log('[TTS] speak() called with:', text);
+        console.log('[TTS] ttsEnabled:', this.ttsEnabled);
+        console.log('[TTS] speechSynthesis available:', 'speechSynthesis' in window);
+        
+        if (!this.ttsEnabled || !('speechSynthesis' in window) || !text.trim()) {
+            console.log('[TTS] Skipping speech - conditions not met');
+            return;
+        }
+
+        // Clean up the text for better speech
+        const cleanText = text
+            .replace(/\|/g, ',')
+            .replace(/Items:/g, 'Items found:')
+            .replace(/Confidence:/g, 'Confidence level:')
+            .replace(/Scene update:/g, '')
+            .replace(/Scene continues:/g, '')
+            .replace(/Scene description:/g, '')
+            .trim();
+
+        console.log('[TTS] Speaking cleaned text:', cleanText);
+        const utterance = new SpeechSynthesisUtterance(cleanText);
+        
+        if (this.currentVoice) {
+            utterance.voice = this.currentVoice;
+        }
+        
+        utterance.rate = this.speechRate ? this.speechRate.value : 0.9;
+        utterance.volume = this.speechVolume ? this.speechVolume.value : 0.8;
+        utterance.pitch = 1.0;
+
+        utterance.onstart = () => {
+            console.log('[TTS] Speech started');
+            this.isSpeaking = true;
+        };
+
+        utterance.onend = () => {
+            console.log('[TTS] Speech ended');
+            this.isSpeaking = false;
+            this.processNextSpeech();
+        };
+
+        utterance.onerror = (event) => {
+            console.warn('[TTS] Speech synthesis error:', event.error);
+            this.isSpeaking = false;
+            this.processNextSpeech();
+        };
+
+        console.log('[TTS] Current voice:', this.currentVoice?.name);
+        console.log('[TTS] Speech rate:', utterance.rate);
+        console.log('[TTS] Speech volume:', utterance.volume);
+
+        if (this.isSpeaking) {
+            console.log('[TTS] Adding to queue');
+            this.speechQueue.push(utterance);
+        } else {
+            console.log('[TTS] Speaking immediately');
+            this.speechSynthesis.speak(utterance);
+        }
+    }
+
+    processNextSpeech() {
+        if (this.speechQueue.length > 0 && !this.isSpeaking) {
+            const nextUtterance = this.speechQueue.shift();
+            this.speechSynthesis.speak(nextUtterance);
+        }
+    }
+
+    stopSpeech() {
+        if ('speechSynthesis' in window) {
+            this.speechSynthesis.cancel();
+            this.speechQueue = [];
+            this.isSpeaking = false;
+        }
+    }
+
+    // Streaming Token Handling for Progressive Display and TTS
+    handleStreamingToken(data) {
+        console.log(`[STREAM] 🎪 Received token: "${data.token}", speedMode: ${this.speedModeEnabled}, mode: ${this.analysisMode.value}`);
+        
+        // Handle streaming tokens when in realtime_description mode or when speed mode is explicitly enabled
+        if (!this.speedModeEnabled && this.analysisMode.value !== 'realtime_description') {
+            console.log(`[STREAM] ❌ Skipping token - speed mode disabled and not in realtime_description mode`);
+            return;
+        }
+
+        const token = data.token;
+        this.streamingBuffer += token;
+        this.currentStreamingText += token;
+        this.lastTokenTime = Date.now();
+        
+        console.log(`[STREAM] ✅ Token processed. Buffer: "${this.streamingBuffer}", Total: "${this.currentStreamingText}"`)
+
+        // Update visual display immediately
+        this.updateStreamingDisplay();
+
+        console.log(`[STREAM] Buffer: "${this.streamingBuffer}"`);
+
+        // Check if we have a complete sentence or phrase to speak (only if TTS enabled)
+        if (this.ttsEnabled && this.shouldSpeakBuffer()) {
+            this.speakStreamingBuffer();
+        }
+
+        // Set timeout to speak remaining buffer if no more tokens arrive
+        clearTimeout(this.streamTimeout);
+        this.streamTimeout = setTimeout(() => {
+            if (this.streamingBuffer.trim() && this.ttsEnabled) {
+                console.log('[STREAM] Timeout reached, speaking remaining buffer');
+                this.speakStreamingBuffer();
+            }
+            // Mark streaming as complete
+            this.markStreamingComplete();
+        }, 1500); // 1.5 second timeout
+    }
+
+    shouldSpeakBuffer() {
+        const buffer = this.streamingBuffer.trim();
+        
+        // Speak if we have a complete sentence
+        if (buffer.match(/[.!?]+\s*$/)) {
+            return true;
+        }
+        
+        // Speak if we have a substantial phrase (after comma)
+        if (buffer.match(/,\s+\w+/)) {
+            return true;
+        }
+        
+        // Speak if buffer is getting long (>100 chars)
+        if (buffer.length > 100) {
+            return true;
+        }
+        
+        return false;
+    }
+
+    speakStreamingBuffer() {
+        if (!this.streamingBuffer.trim()) {
+            return;
+        }
+
+        const textToSpeak = this.streamingBuffer.trim();
+        console.log(`[STREAM] Speaking: "${textToSpeak}"`);
+        
+        // Speak the accumulated text
+        this.speak(textToSpeak);
+        
+        // Clear the buffer
+        this.streamingBuffer = "";
+    }
+
+    updateStreamingDisplay() {
+        const streamingText = document.getElementById('streamingText');
+        if (streamingText) {
+            // Combine history with current streaming text
+            let fullText = '';
+            
+            // Add previous descriptions with timestamps
+            this.streamingHistory.forEach((description, index) => {
+                const timestamp = new Date(description.timestamp).toLocaleTimeString();
+                fullText += `[${timestamp}] ${description.text}\n\n`;
+            });
+            
+            // Add current streaming text if any
+            if (this.currentStreamingText) {
+                fullText += `[Live] ${this.currentStreamingText}`;
+            } else if (this.streamingHistory.length === 0) {
+                fullText = 'Waiting for description...';
+            }
+            
+            streamingText.textContent = fullText;
+            
+            // Auto-scroll to bottom to show latest content
+            streamingText.scrollTop = streamingText.scrollHeight;
+        }
+    }
+
+    markStreamingComplete() {
+        const streamingIndicator = document.querySelector('.streaming-indicator');
+        
+        // Save current streaming text to history if it exists
+        if (this.currentStreamingText.trim()) {
+            this.streamingHistory.push({
+                text: this.currentStreamingText.trim(),
+                timestamp: Date.now()
+            });
+            
+            // Keep only last 10 descriptions to prevent overflow
+            if (this.streamingHistory.length > 10) {
+                this.streamingHistory.shift();
+            }
+        }
+        
+        if (streamingIndicator) {
+            streamingIndicator.style.animation = 'none';
+            streamingIndicator.style.opacity = '0.3';
+        }
+        
+        // Reset for next stream (but keep history)
+        setTimeout(() => {
+            if (streamingIndicator) {
+                streamingIndicator.style.animation = 'pulse 1.5s infinite';
+                streamingIndicator.style.opacity = '1';
+            }
+            this.currentStreamingText = '';
+            this.updateStreamingDisplay(); // Refresh display to show history
+        }, 1000); // Reduced delay
     }
 }
 

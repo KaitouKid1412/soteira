@@ -456,6 +456,7 @@
                     <select id="analysisMode" class="form-control">
                         <option value="summary">Summary Mode</option>
                         <option value="alert">Alert Mode</option>
+                        <option value="realtime_description">🎤 Real-time Description (Accessibility)</option>
                         <option value="analysis">Analysis Mode</option>
                     </select>
                 </div>
@@ -466,6 +467,46 @@
                               placeholder="Describe what you want to analyze in the video...">Analyze this video for any security threats, suspicious activity, or unusual behavior. Pay attention to people, vehicles, and any potential safety concerns.</textarea>
                 </div>
 
+
+                <!-- TTS Controls for Accessibility -->
+                <div class="control-group" style="border-top: 1px solid #333; padding-top: 1rem; margin-top: 1rem;">
+                    <div style="display: flex; flex-direction: column; gap: 0.5rem; margin-bottom: 1rem;">
+                        <label style="display: flex; align-items: center; gap: 0.5rem;">
+                            <input type="checkbox" id="ttsToggle" style="transform: scale(1.2);">
+                            <span>🔊 Enable Text-to-Speech (for real-time descriptions)</span>
+                        </label>
+                        
+                        <label style="display: flex; align-items: center; gap: 0.5rem;">
+                            <input type="checkbox" id="speedModeToggle" style="transform: scale(1.2);">
+                            <span>⚡ Speed Mode (Gemini Flash 2.5 streaming for fastest response)</span>
+                        </label>
+                    </div>
+                    
+                    <div class="control-row" style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-bottom: 0.5rem;">
+                        <div>
+                            <label for="voiceSelect" style="font-size: 0.9rem; color: #ccc;">Voice:</label>
+                            <select id="voiceSelect" class="form-control" style="padding: 0.3rem;">
+                                <option>Loading voices...</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label for="speechRate" style="font-size: 0.9rem; color: #ccc;">Speed:</label>
+                            <input type="range" id="speechRate" min="0.5" max="2" step="0.1" value="0.9" class="form-control" style="padding: 0.3rem;">
+                        </div>
+                    </div>
+                    
+                    <div class="control-row" style="display: grid; grid-template-columns: 1fr auto; gap: 1rem; align-items: end;">
+                        <div>
+                            <label for="speechVolume" style="font-size: 0.9rem; color: #ccc;">Volume:</label>
+                            <input type="range" id="speechVolume" min="0" max="1" step="0.1" value="0.8" class="form-control" style="padding: 0.3rem;">
+                        </div>
+                        <div>
+                            <button id="testTtsBtn" class="btn" style="background: rgba(255,255,255,0.1); color: #ccc; padding: 0.3rem 0.8rem; font-size: 0.8rem;">
+                                Test Voice
+                            </button>
+                        </div>
+                    </div>
+                </div>
 
                 <div class="control-group" style="display: flex; gap: 1rem;">
                     <button id="startBtn" class="btn btn-primary" style="flex: 1;">
@@ -487,6 +528,20 @@
                     Clear All
                 </button>
             </div>
+            
+            <!-- Real-time Streaming Display -->
+            <div id="streamingDisplay" style="display: none; margin-bottom: 1rem;">
+                <div style="background: rgba(0, 212, 255, 0.1); border: 1px solid rgba(0, 212, 255, 0.3); border-radius: 8px; padding: 1rem;">
+                    <div style="display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.5rem;">
+                        <div class="streaming-indicator" style="width: 8px; height: 8px; background: #00d4ff; border-radius: 50%; animation: pulse 1.5s infinite;"></div>
+                        <span style="font-size: 0.9rem; color: #00d4ff; font-weight: 500;">Live Description</span>
+                    </div>
+                    <div id="streamingText" style="color: #fff; font-size: 1rem; line-height: 1.4; min-height: 1.5rem; max-height: 300px; overflow-y: auto; white-space: pre-wrap; font-family: 'SF Mono', Monaco, 'Consolas', monospace;">
+                        Waiting for description...
+                    </div>
+                </div>
+            </div>
+            
             <div class="alerts-list" id="alertsList">
                 <div class="no-alerts">No alerts yet. Start video analysis to see real-time notifications.</div>
             </div>
