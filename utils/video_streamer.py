@@ -34,7 +34,7 @@ class VideoStreamer:
         self.frame_interval = 1.0 / 30.0  # Time between frames
         
         # Streaming state
-        self.frame_queue = queue.Queue(maxsize=10)  # Buffer for smooth playback
+        self.frame_queue = queue.Queue(maxsize=100)  # Buffer for smooth playback
         self.streaming = False
         self.streamer_thread = None
         
@@ -147,7 +147,19 @@ class VideoStreamer:
                 queue_size = self.frame_queue.qsize()
                 elapsed = time.time() - self.start_time if self.start_time else 0
                 actual_fps = self.frames_streamed / elapsed if elapsed > 0 else 0
-                print(f"[STREAMER DROP] Frame {self.frames_streamed} dropped - Queue full ({queue_size}/10), actual FPS: {actual_fps:.1f}, target: {self.fps:.1f}")
+                
+                # Only print drop message every 50 frames to reduce spam
+                if self.frames_streamed % 50 == 0:
+                    print(f"[STREAMER DROP] Frame {self.frames_streamed} dropped - Queue full ({queue_size}/100), actual FPS: {actual_fps:.1f}, target: {self.fps:.1f}")
+                
+                # Skip multiple frames when queue is consistently full
+                if queue_size > 80:  # Queue is 80% full
+                    # Skip ahead to reduce backlog
+                    for _ in range(min(5, queue_size - 70)):
+                        try:
+                            self.frame_queue.get_nowait()
+                        except queue.Empty:
+                            break
     
     def read(self):
         """
