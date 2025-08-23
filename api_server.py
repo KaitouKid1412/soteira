@@ -131,7 +131,7 @@ class VideoAnalysisServer:
             "restaurant.mov": ProcessingConfig(
                 video_path="videos/restaurant.mov",
                 mode="alert",
-                prompt="Alert me whenever there is a food safety standard violation in the video",
+                prompt="Alert me whenever there is a food hygiene violation in the video",
                 motion_thresh=0.2,
                 conf=0.7,
                 imgsz=256,
