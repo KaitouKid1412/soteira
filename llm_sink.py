@@ -420,6 +420,7 @@ class LLMSink:
         self.last_description_timestamp = 0.0
         self.description_interval_ms = 3000  # 3 seconds between descriptions
         self.last_scene_description = ""  # Store last description for context
+        self.description_context_history = []  # Store recent descriptions for context (max 5)
         
         # Image similarity tracking - maintain history of sent images
         self.sent_image_features = []  # List of all sent image features
@@ -641,7 +642,21 @@ class LLMSink:
             try:
                 # Use frame_data if available, otherwise fall back to image_path
                 image_source = frame_data if frame_data is not None else image_path
-                response = send_to_openai_vision(self.image_prompt, image_source, self.openai_api_key, use_fast_model=use_fast_model)
+                
+                # For realtime_description mode, enhance prompt with context
+                prompt_to_use = self.image_prompt
+                if self.mode == "realtime_description" and self.description_context_history:
+                    # Add context from previous descriptions
+                    context_text = " | ".join(self.description_context_history[-3:])  # Last 3 descriptions
+                    enhanced_prompt = self.image_prompt.replace(
+                        "This is a frame from a live video stream.", 
+                        f"This is a frame from a live video stream. Previous descriptions: [{context_text}]."
+                    )
+                    prompt_to_use = enhanced_prompt
+                    if self.debug_mode:
+                        print(f"[REALTIME_DESC] Using context with {len(self.description_context_history)} previous descriptions")
+                
+                response = send_to_openai_vision(prompt_to_use, image_source, self.openai_api_key, use_fast_model=use_fast_model)
                 return response
                 
             except Exception as e:
@@ -1074,6 +1089,11 @@ The user appears to be engaged in {', '.join(unique_activities[:3]) if unique_ac
                         # Store current description for next comparison
                         self.last_scene_description = description
                         self.last_description_timestamp = current_time
+                        
+                        # Add to context history for future prompts (keep last 5)
+                        self.description_context_history.append(description)
+                        if len(self.description_context_history) > 5:
+                            self.description_context_history.pop(0)  # Remove oldest
                         
                         # Create an alert-style notification for TTS
                         # This uses the same mechanism as the alert system
