@@ -13,15 +13,15 @@
 
         body {
             font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-            background: linear-gradient(135deg, #0c0c0c 0%, #1a1a1a 100%);
-            color: #ffffff;
+            background: linear-gradient(135deg, #ffffff 0%, #f8f8f8 100%);
+            color: #333333;
             min-height: 100vh;
         }
 
         .header {
-            background: rgba(0, 0, 0, 0.8);
+            background: rgba(255, 255, 255, 0.9);
             backdrop-filter: blur(10px);
-            border-bottom: 1px solid #333;
+            border-bottom: 1px solid #e0e0e0;
             padding: 1rem 2rem;
             position: sticky;
             top: 0;
@@ -31,14 +31,14 @@
         .header h1 {
             font-size: 1.8rem;
             font-weight: 700;
-            background: linear-gradient(135deg, #00d4ff, #0099cc);
+            background: linear-gradient(135deg, #dc2626, #991b1b);
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
             background-clip: text;
         }
 
         .header .subtitle {
-            color: #888;
+            color: #666;
             font-size: 0.9rem;
             margin-top: 0.2rem;
         }
@@ -57,20 +57,22 @@
         }
 
         .video-section {
-            background: rgba(30, 30, 30, 0.6);
+            background: rgba(255, 255, 255, 0.8);
             border-radius: 16px;
             padding: 1.5rem;
-            border: 1px solid #333;
+            border: 1px solid #e0e0e0;
             backdrop-filter: blur(10px);
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
         }
 
         .controls-section {
-            background: rgba(30, 30, 30, 0.6);
+            background: rgba(255, 255, 255, 0.8);
             border-radius: 16px;
             padding: 1.5rem;
-            border: 1px solid #333;
+            border: 1px solid #e0e0e0;
             backdrop-filter: blur(10px);
             height: fit-content;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
         }
 
         .video-container {
@@ -124,23 +126,23 @@
             display: block;
             margin-bottom: 0.5rem;
             font-weight: 500;
-            color: #ccc;
+            color: #555;
         }
 
         .form-control {
             width: 100%;
             padding: 0.75rem;
-            background: rgba(50, 50, 50, 0.8);
-            border: 1px solid #444;
+            background: rgba(255, 255, 255, 0.9);
+            border: 1px solid #ccc;
             border-radius: 8px;
-            color: #fff;
+            color: #333;
             font-size: 0.9rem;
         }
 
         .form-control:focus {
             outline: none;
-            border-color: #00d4ff;
-            box-shadow: 0 0 0 3px rgba(0, 212, 255, 0.1);
+            border-color: #dc2626;
+            box-shadow: 0 0 0 3px rgba(220, 38, 38, 0.1);
         }
 
         .btn {
@@ -154,23 +156,23 @@
         }
 
         .btn-primary {
-            background: linear-gradient(135deg, #00d4ff, #0099cc);
+            background: linear-gradient(135deg, #dc2626, #991b1b);
             color: white;
         }
 
         .btn-primary:hover {
             transform: translateY(-1px);
-            box-shadow: 0 4px 12px rgba(0, 212, 255, 0.3);
+            box-shadow: 0 4px 12px rgba(220, 38, 38, 0.3);
         }
 
         .btn-danger {
-            background: linear-gradient(135deg, #ff4444, #cc0000);
+            background: linear-gradient(135deg, #b91c1c, #7f1d1d);
             color: white;
         }
 
         .btn-danger:hover {
             transform: translateY(-1px);
-            box-shadow: 0 4px 12px rgba(255, 68, 68, 0.3);
+            box-shadow: 0 4px 12px rgba(185, 28, 28, 0.3);
         }
 
         .btn:disabled {
@@ -187,33 +189,35 @@
         }
 
         .stat-card {
-            background: rgba(40, 40, 40, 0.6);
+            background: rgba(255, 255, 255, 0.8);
             padding: 1rem;
             border-radius: 12px;
-            border: 1px solid #333;
+            border: 1px solid #e0e0e0;
             text-align: center;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
         }
 
         .stat-value {
             font-size: 1.8rem;
             font-weight: 700;
-            color: #00d4ff;
+            color: #dc2626;
             margin-bottom: 0.3rem;
         }
 
         .stat-label {
-            color: #888;
+            color: #666;
             font-size: 0.8rem;
             text-transform: uppercase;
             letter-spacing: 0.5px;
         }
 
         .alerts-section {
-            background: rgba(30, 30, 30, 0.6);
+            background: rgba(255, 255, 255, 0.8);
             border-radius: 16px;
             padding: 1.5rem;
-            border: 1px solid #333;
+            border: 1px solid #e0e0e0;
             backdrop-filter: blur(10px);
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
         }
 
         .alerts-header {
@@ -229,8 +233,8 @@
         }
 
         .alert-item {
-            background: rgba(255, 68, 68, 0.1);
-            border: 1px solid rgba(255, 68, 68, 0.3);
+            background: rgba(220, 38, 38, 0.1);
+            border: 1px solid rgba(220, 38, 38, 0.3);
             border-radius: 8px;
             padding: 1rem;
             margin-bottom: 0.5rem;
@@ -243,7 +247,7 @@
 
         .alert-time {
             font-size: 0.8rem;
-            color: #888;
+            color: #666;
             position: absolute;
             top: 0.5rem;
             right: 1rem;
@@ -256,7 +260,57 @@
 
         .no-alerts {
             text-align: center;
+            color: #999;
+            padding: 2rem;
+            font-style: italic;
+        }
+
+        /* Q&A Section Styles */
+        .qa-section {
+            background: rgba(255, 255, 255, 0.8);
+            border-radius: 16px;
+            padding: 1.5rem;
+            border: 1px solid #e0e0e0;
+            backdrop-filter: blur(10px);
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+
+        .qa-header {
+            margin-bottom: 1.5rem;
+        }
+
+        .qa-item {
+            background: rgba(248, 248, 248, 0.8);
+            border: 1px solid #e0e0e0;
+            border-radius: 12px;
+            padding: 1.5rem;
+            margin-bottom: 1rem;
+        }
+
+        .qa-question {
+            font-weight: 600;
+            color: #dc2626;
+            margin-bottom: 0.8rem;
+            font-size: 1rem;
+        }
+
+        .qa-answer {
+            color: #333;
+            line-height: 1.6;
+            white-space: pre-wrap;
+        }
+
+        .qa-loading {
+            display: flex;
+            align-items: center;
+            gap: 0.8rem;
             color: #666;
+            font-style: italic;
+        }
+
+        .no-qa {
+            text-align: center;
+            color: #999;
             padding: 2rem;
             font-style: italic;
         }
@@ -287,9 +341,9 @@
             display: inline-block;
             width: 20px;
             height: 20px;
-            border: 3px solid #333;
+            border: 3px solid #e0e0e0;
             border-radius: 50%;
-            border-top-color: #00d4ff;
+            border-top-color: #dc2626;
             animation: spin 1s ease-in-out infinite;
         }
 
@@ -434,9 +488,9 @@
                     <label for="videoPreset">Video Preset:</label>
                     <select id="videoPreset" class="form-control">
                         <option value="">Custom Configuration</option>
-                        <option value="baby.mov">🏠 Indoor Low Activity</option>
+                        <option value="baby.mov">🏠 Low Activity</option>
                         <option value="desktop.mov">🖥️ Screen Sharing</option>
-                        <option value="restaurant.mov">🏢 Indoor High Activity</option>
+                        <option value="restaurant.mov">🏢 High Activity</option>
                         <option value="phone_stream">📱 Phone Stream (WebRTC)</option>
                         <option value="movie">🎬 Movie</option>
                     </select>
@@ -457,7 +511,7 @@
                     <select id="analysisMode" class="form-control">
                         <option value="summary">Summary Mode</option>
                         <option value="alert">Alert Mode</option>
-                        <option value="analysis">Analysis Mode</option>
+                        <option value="realtime_description">🎤 Real-time Description (Accessibility)</option>
                     </select>
                 </div>
 
@@ -467,6 +521,46 @@
                               placeholder="Describe what you want to analyze in the video...">Analyze this video for any security threats, suspicious activity, or unusual behavior. Pay attention to people, vehicles, and any potential safety concerns.</textarea>
                 </div>
 
+
+                <!-- TTS Controls for Accessibility -->
+                <div class="control-group" style="border-top: 1px solid #333; padding-top: 1rem; margin-top: 1rem;">
+                    <div style="display: flex; flex-direction: column; gap: 0.5rem; margin-bottom: 1rem;">
+                        <label style="display: flex; align-items: center; gap: 0.5rem;">
+                            <input type="checkbox" id="ttsToggle" style="transform: scale(1.2);">
+                            <span>🔊 Enable Text-to-Speech (for real-time descriptions)</span>
+                        </label>
+                        
+                        <label style="display: flex; align-items: center; gap: 0.5rem;">
+                            <input type="checkbox" id="speedModeToggle" style="transform: scale(1.2);">
+                            <span>⚡ Speed Mode (Gemini Flash 2.5 streaming for fastest response)</span>
+                        </label>
+                    </div>
+                    
+                    <div class="control-row" style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-bottom: 0.5rem;">
+                        <div>
+                            <label for="voiceSelect" style="font-size: 0.9rem; color: #ccc;">Voice:</label>
+                            <select id="voiceSelect" class="form-control" style="padding: 0.3rem;">
+                                <option>Loading voices...</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label for="speechRate" style="font-size: 0.9rem; color: #ccc;">Speed:</label>
+                            <input type="range" id="speechRate" min="0.5" max="2" step="0.1" value="0.9" class="form-control" style="padding: 0.3rem;">
+                        </div>
+                    </div>
+                    
+                    <div class="control-row" style="display: grid; grid-template-columns: 1fr auto; gap: 1rem; align-items: end;">
+                        <div>
+                            <label for="speechVolume" style="font-size: 0.9rem; color: #ccc;">Volume:</label>
+                            <input type="range" id="speechVolume" min="0" max="1" step="0.1" value="0.8" class="form-control" style="padding: 0.3rem;">
+                        </div>
+                        <div>
+                            <button id="testTtsBtn" class="btn" style="background: rgba(255,255,255,0.1); color: #ccc; padding: 0.3rem 0.8rem; font-size: 0.8rem;">
+                                Test Voice
+                            </button>
+                        </div>
+                    </div>
+                </div>
 
                 <div class="control-group" style="display: flex; gap: 1rem;">
                     <button id="startBtn" class="btn btn-primary" style="flex: 1;">
@@ -488,6 +582,20 @@
                     Clear All
                 </button>
             </div>
+            
+            <!-- Real-time Streaming Display -->
+            <div id="streamingDisplay" style="display: none; margin-bottom: 1rem;">
+                <div style="background: rgba(220, 38, 38, 0.1); border: 1px solid rgba(220, 38, 38, 0.3); border-radius: 8px; padding: 1rem;">
+                    <div style="display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.5rem;">
+                        <div class="streaming-indicator" style="width: 8px; height: 8px; background: #dc2626; border-radius: 50%; animation: pulse 1.5s infinite;"></div>
+                        <span style="font-size: 0.9rem; color: #dc2626; font-weight: 500;">Live Description</span>
+                    </div>
+                    <div id="streamingText" style="color: #333; font-size: 1rem; line-height: 1.4; min-height: 1.5rem; max-height: 300px; overflow-y: auto; white-space: pre-wrap; font-family: 'SF Mono', Monaco, 'Consolas', monospace;">
+                        Waiting for description...
+                    </div>
+                </div>
+            </div>
+            
             <div class="alerts-list" id="alertsList">
                 <div class="no-alerts">No alerts yet. Start video analysis to see real-time notifications.</div>
             </div>
@@ -501,10 +609,38 @@
             <div class="summary-content" id="summaryContent">
                 <div class="summary-loading" id="summaryLoading" style="display: none;">
                     <div class="loading-spinner"></div>
-                    <div style="margin-top: 1rem; color: #ccc;">Generating summary...</div>
+                    <div style="margin-top: 1rem; color: #999;">Generating summary...</div>
                 </div>
                 <div class="summary-text" id="summaryText" style="display: none;">
                     <div style="line-height: 1.6; white-space: pre-wrap;"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Q&A Section (for alert and summary modes) -->
+        <div class="qa-section" id="qaSection" style="display: none;">
+            <div class="qa-header">
+                <h2>Ask Questions About the Video</h2>
+                <p style="color: #666; font-size: 0.9rem; margin-top: 0.5rem;">Ask questions about what happened in the processed video using AI analysis</p>
+            </div>
+            
+            <div class="qa-input-section" style="margin-bottom: 1.5rem;">
+                <div class="control-group">
+                    <label for="questionInput">Your Question:</label>
+                    <div style="display: flex; gap: 1rem;">
+                        <input type="text" id="questionInput" class="form-control" 
+                               placeholder="e.g., What activities did I see in the video?" 
+                               style="flex: 1;" onkeypress="if(event.key==='Enter') askQuestion()">
+                        <button id="askBtn" class="btn btn-primary" onclick="askQuestion()" style="white-space: nowrap;">
+                            Ask Question
+                        </button>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="qa-history" id="qaHistory">
+                <div class="no-qa" style="text-align: center; color: #999; padding: 2rem; font-style: italic;">
+                    Process a video first, then ask questions about what you observed.
                 </div>
             </div>
         </div>

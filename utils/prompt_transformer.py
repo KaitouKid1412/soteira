@@ -28,7 +28,7 @@ class LLMPromptTransformer:
         
         Args:
             user_query: Original user query
-            mode: Processing mode ('summary' or 'alert')
+            mode: Processing mode ('summary', 'alert', or 'realtime_description')
             
         Returns:
             Dict with transformed prompt and metadata
@@ -56,6 +56,28 @@ Response: {"image_prompt": "Analyze this image for weapons or dangerous objects.
 
 User: "check for smoking"
 Response: {"image_prompt": "Look for smoking or cigarettes in this image. Respond in JSON: {'detected': true/false, 'items': [], 'confidence': 0-1, 'description': 'observation', 'alert': true/false}. Set alert=true if smoking is detected.", "intent": "detection", "target_objects": ["cigarette", "smoking"], "alert_condition": "Smoking or cigarettes detected"}"""
+        elif mode == "realtime_description":
+            system_prompt = """You are a prompt transformation expert. Your job is to convert user queries into image analysis prompts for REAL-TIME ACCESSIBILITY descriptions.
+
+Transform user queries into prompts that:
+1. Provide immediate, useful scene descriptions for blind users
+2. Focus on spatial awareness, movement, and context
+3. Return clear, conversational descriptions in JSON
+
+Respond ONLY with valid JSON:
+{
+  "image_prompt": "The prompt to send with each image",
+  "intent": "accessibility_description", 
+  "target_objects": ["elements to describe"],
+  "description_focus": "What to emphasize for accessibility"
+}
+
+Examples:
+User: "Describe what you see in the scene"
+Response: {"image_prompt": "This is a frame from a live video stream. Describe this scene for a blind person in 1-2 sentences. Respond ONLY in JSON: {'analysis': 'brief description of people, activities, and key objects', 'confidence': 0.8}. Keep the analysis under 50 words. Focus on what's happening NOW in this moment.", "intent": "accessibility_description", "target_objects": ["people", "objects", "environment", "activities", "spatial_layout"], "description_focus": "Clear spatial awareness and activity description"}
+
+User: "Help me understand my surroundings"
+Response: {"image_prompt": "Provide a comprehensive scene description for accessibility. Respond in JSON: {'analysis': 'description covering: immediate surroundings, people and their actions, objects and their positions, potential navigation information, current activities', 'confidence': 0-1}. Use clear, helpful language focusing on what's useful for spatial understanding.", "intent": "accessibility_description", "target_objects": ["environment", "navigation", "people", "obstacles", "activities"], "description_focus": "Navigation assistance and environmental awareness"}"""
         else:  # summary mode
             system_prompt = """You are a prompt transformation expert. Your job is to convert user queries into image analysis prompts for SUMMARY generation systems.
 
@@ -86,8 +108,8 @@ Response: {"image_prompt": "Describe the office activity in this image. Respond 
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_query}
                 ],
-                temperature=0.1,  # Low temperature for consistent output
-                max_tokens=500
+                temperature=0.0,  # Zero temperature for fastest responses
+                max_tokens=2000  # Reduced tokens for faster transformation
             )
             
             # Parse the JSON response
@@ -161,6 +183,16 @@ class SimplePromptTransformer:
                     "mode": mode,
                     "transformation_success": True
                 }
+            elif mode == "realtime_description":
+                return {
+                    "image_prompt": "This is a frame from a live video stream. Describe what you see for a blind person in 1-2 short sentences. Respond ONLY in JSON: {'analysis': 'brief description of people and their activities', 'confidence': 0.8}. Keep under 30 words. Focus on current moment and actions.",
+                    "intent": "accessibility_description",
+                    "target_objects": ["people", "activities", "spatial_layout"],
+                    "description_focus": "People-focused accessibility description",
+                    "original_query": user_query,
+                    "mode": mode,
+                    "transformation_success": True
+                }
             else:  # summary mode
                 return {
                     "image_prompt": "Describe any people visible in this image in detail. Respond in JSON format: {'people_count': number, 'activities': ['list of activities'], 'descriptions': ['detailed descriptions'], 'confidence': 0-1}",
@@ -199,6 +231,16 @@ class SimplePromptTransformer:
                     "intent": "analysis",
                     "target_objects": [],
                     "alert_condition": "Noteworthy or concerning content detected",
+                    "original_query": user_query,
+                    "mode": mode,
+                    "transformation_success": True
+                }
+            elif mode == "realtime_description":
+                return {
+                    "image_prompt": f"This is a frame from a live video stream. Describe the current scene for a blind person in 1-2 sentences. Respond ONLY in JSON: {{'analysis': 'brief description of what is happening right now', 'confidence': 0.8}}. Keep under 40 words. Focus on: '{user_query}'",
+                    "intent": "accessibility_description",
+                    "target_objects": ["environment", "objects", "people", "activities"],
+                    "description_focus": "General accessibility description",
                     "original_query": user_query,
                     "mode": mode,
                     "transformation_success": True

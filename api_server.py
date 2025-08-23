@@ -6,6 +6,7 @@ Provides REST API and WebSocket endpoints for real-time video processing.
 
 import asyncio
 import json
+import os
 import threading
 import time
 from datetime import datetime
@@ -39,6 +40,7 @@ class ProcessingConfig(BaseModel):
     disable_quality_filter: bool = True
     skip_scene: bool = False
     stop_on_good_frame: bool = True
+    streaming_mode: bool = False  # Enable Gemini Flash 2.5 streaming
 
 
 class ProcessingStatus(BaseModel):
@@ -58,6 +60,10 @@ class AlertNotification(BaseModel):
     message: str
     confidence: float
     frame_path: Optional[str] = None
+
+
+class QuestionRequest(BaseModel):
+    question: str
 
 
 class VideoAnalysisServer:
@@ -82,6 +88,13 @@ class VideoAnalysisServer:
             "total_frames": 0,
             "detections_count": 0
         }
+        
+        # Queue for pending alerts to broadcast
+        self.pending_alerts_queue = []
+        self.last_alert_broadcast_check = 0
+        
+        # Queue for streaming tokens
+        self.pending_token_queue = []
         
     def get_video_presets(self):
         """Get predefined video configurations."""
@@ -110,7 +123,7 @@ class VideoAnalysisServer:
                 scene_hist=0.7,  # Default since --skip-scene is True
                 scene_ssim=0.85,  # Default since --skip-scene is True
                 buffer_frames=3,
-                similarity_threshold=0.975,
+                similarity_threshold=0.75,  # Optimized for speed
                 disable_quality_filter=True,
                 skip_scene=False,
                 stop_on_good_frame=True
@@ -118,7 +131,7 @@ class VideoAnalysisServer:
             "restaurant.mov": ProcessingConfig(
                 video_path="videos/restaurant.mov",
                 mode="alert",
-                prompt="Alert me whenever you see meat in the video ?",
+                prompt="Alert me whenever there is a food hygiene violation in the video",
                 motion_thresh=0.2,
                 conf=0.7,
                 imgsz=256,
@@ -132,8 +145,8 @@ class VideoAnalysisServer:
             ),
             "phone_stream": ProcessingConfig(
                 video_path="phone",
-                mode="alert",
-                prompt="Monitor for security threats and suspicious activity",
+                mode="realtime_description",
+                prompt="Provide clear, concise scene descriptions for accessibility. Focus on: people and their activities, objects and locations, any movement or changes. Keep descriptions brief but informative.",
                 motion_thresh=0.02,
                 conf=0.4,
                 imgsz=416,
@@ -146,16 +159,16 @@ class VideoAnalysisServer:
                 stop_on_good_frame=True
             ),
             "movie": ProcessingConfig(
-                video_path="movie.mp4",
+                video_path="videos/movie.mp4",
                 mode="alert",
-                prompt="Alert me whenever a person performs any action in the video, descibe every in detail.",
+                prompt="You are an expert movie narrator. You are being sent a sequence of deduplicated frames from a movie in real time. Your job is to narrate what's happening on screen as if telling a story, adding context from previous frames to make it cohesive and engaging.\nInstructions:\nContext Awareness: Maintain a running understanding of previous frames to narrate the story naturally, even if the current frame has minimal change.\nNo Repetition: Do not restate things already clearly described earlier unless they have meaningfully changed or progressed.\nNarrative Focus: Prioritize describing character actions, emotions, setting changes, and plot developments over static details.\nConciseness: Be vivid but efficient, avoiding redundant or filler text.\nStorytelling Tone: Make it sound like a smooth narration for a movie audience, not a frame-by-frame commentary.\nReal-Time Adaptation: Assume frames may skip minor transitions—fill small gaps logically, maintaining narrative flow.\nNo Guesswork: Avoid inventing details not supported by visual evidence, but infer obvious next actions (e.g., someone raising a hand to knock).\nContinuity Memory: Remember character names, locations, and scene context from earlier frames for seamless narration.\nIgnore Deduplication Artifacts: If a frame looks similar to a previous one, briefly acknowledge continuity instead of describing the same static content again.\nYour output should feel like a natural ongoing movie narration, not repetitive frame labeling.",
                 motion_thresh=0.001,
                 conf=0.3,
                 imgsz=320,
                 scene_hist=0.7,
                 scene_ssim=0.85,
                 buffer_frames=3,
-                similarity_threshold=0.7,
+                similarity_threshold=0.9,
                 disable_quality_filter=True,
                 skip_scene=True,
                 stop_on_good_frame=True
@@ -215,8 +228,9 @@ class VideoAnalysisServer:
                     preset_dict = preset_config.model_dump()
                     preset_dict['mode'] = config.mode  # Override with user's mode selection
                     preset_dict['prompt'] = config.prompt  # Override with user's prompt
+                    preset_dict['streaming_mode'] = config.streaming_mode  # Preserve streaming mode setting
                     config = ProcessingConfig(**preset_dict)
-                    print(f"[API] Applied preset config: skip_scene={config.skip_scene}")
+                    print(f"[API] Applied preset config: skip_scene={config.skip_scene}, streaming_mode={config.streaming_mode}")
                     break
             
             # Validate video file exists (skip for phone stream)
@@ -285,6 +299,24 @@ class VideoAnalysisServer:
                 return {"summary": summary}
             return {"summary": "No summary available."}
         
+        @self.app.post("/ask_question")
+        async def ask_question(request: QuestionRequest):
+            """Ask a question about the processed video."""
+            if not self.video_system or not hasattr(self.video_system, 'llm_sink'):
+                raise HTTPException(status_code=404, detail="No video processing system available")
+            
+            if not self.current_config:
+                raise HTTPException(status_code=400, detail="No video has been processed yet")
+            
+            if self.current_config.mode not in ["alert", "summary"]:
+                raise HTTPException(status_code=400, detail="Q&A only available in alert and summary modes")
+            
+            try:
+                answer = self.video_system.llm_sink.answer_question(request.question)
+                return {"question": request.question, "answer": answer}
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Error processing question: {str(e)}")
+        
         @self.app.get("/video_feed")
         async def video_feed():
             """Stream current video frames."""
@@ -324,13 +356,57 @@ class VideoAnalysisServer:
             await self.connect_websocket(websocket)
             try:
                 while True:
-                    # Send periodic status updates
-                    status = await get_status()
-                    await websocket.send_json({
-                        "type": "status_update",
-                        "data": status.model_dump()
-                    })
-                    await asyncio.sleep(1.0)
+                    # Check for pending streaming tokens
+                    if self.pending_token_queue:
+                        print(f"[WS] Found {len(self.pending_token_queue)} tokens in queue")
+                        while self.pending_token_queue:
+                            token_data = self.pending_token_queue.pop(0)
+                            print(f"[WS] 🚀 Broadcasting token: '{token_data['token']}'")
+                            await websocket.send_json({
+                                "type": "token_stream",
+                                "data": {
+                                    "token": token_data['token'],
+                                    "timestamp": token_data['timestamp']
+                                }
+                            })
+                            print(f"[WS] ✅ Token broadcast complete")
+                    else:
+                        # Periodic check to show queue is empty (only occasionally)
+                        import time
+                        if not hasattr(self, '_last_empty_log') or time.time() - self._last_empty_log > 10:
+                            print(f"[WS] Token queue empty")
+                            self._last_empty_log = time.time()
+                    
+                    # Check for pending alerts to broadcast
+                    if self.pending_alerts_queue:
+                        while self.pending_alerts_queue:
+                            alert = self.pending_alerts_queue.pop(0)
+                            print(f"[WS] Broadcasting queued alert: {alert.message}")
+                            # Convert datetime to ISO string for JSON serialization
+                            alert_data = {
+                                "id": alert.id,
+                                "timestamp": alert.timestamp.isoformat(),
+                                "message": alert.message,
+                                "confidence": alert.confidence,
+                                "frame_path": alert.frame_path
+                            }
+                            await websocket.send_json({
+                                "type": "new_alert",
+                                "data": alert_data
+                            })
+                            print(f"[WS] Alert broadcast complete")
+                    
+                    # Send periodic status updates (less frequent for performance)
+                    if not hasattr(self, '_last_status_time') or time.time() - self._last_status_time > 5:
+                        status = await get_status()
+                        await websocket.send_json({
+                            "type": "status_update",
+                            "data": status.model_dump()
+                        })
+                        self._last_status_time = time.time()
+                    
+                    # Very short sleep for real-time token streaming
+                    await asyncio.sleep(0.1)  # 100ms for near real-time
                     
             except WebSocketDisconnect:
                 self.disconnect_websocket(websocket)
@@ -402,15 +478,21 @@ class VideoAnalysisServer:
             "data": alert.model_dump()
         }
         
+        print(f"[WS] Broadcasting alert to {len(self.active_connections)} connections")
+        print(f"[WS] Alert message: {alert.message}")
+        
         # Remove disconnected clients
         connected = []
         for connection in self.active_connections:
             try:
                 await connection.send_json(message)
                 connected.append(connection)
-            except:
-                pass
+                print(f"[WS] Successfully sent alert to WebSocket client")
+            except Exception as e:
+                print(f"[WS] Failed to send to WebSocket client: {e}")
+        
         self.active_connections = connected
+        print(f"[WS] Active connections after broadcast: {len(self.active_connections)}")
     
     def _run_processing(self):
         """Run video processing in background thread."""
@@ -492,9 +574,11 @@ class VideoAnalysisServer:
                 no_display=False,
                 
                 # LLM processing
-                llm_workers=2,
+                llm_workers=8,  # Increased for better real-time performance
                 similarity_threshold=self.current_config.similarity_threshold,
                 mode=self.current_config.mode,
+                streaming_mode=self.current_config.streaming_mode,
+                gemini_api_key=os.getenv('GEMINI_API_KEY'),
                 
                 # Performance
                 enable_60fps_mode=False,
@@ -512,8 +596,8 @@ class VideoAnalysisServer:
             self.video_system = VideoGatingSystem(args)
             print(f"[API] VideoGatingSystem created, web_display: {hasattr(self.video_system, 'web_display')}")
             
-            # Setup callback for alerts (if in alert mode)
-            if self.current_config.mode == "alert":
+            # Setup callback for alerts (if in alert or realtime_description mode)
+            if self.current_config.mode in ["alert", "realtime_description"]:
                 def alert_callback(message):
                     alert = AlertNotification(
                         id=str(len(self.alerts)),
@@ -543,6 +627,10 @@ class VideoAnalysisServer:
                         )
                         self.server.alerts.append(alert)
                         print(f"[API] Alert added to server.alerts, total count: {len(self.server.alerts)}")
+                        
+                        # Add to queue for WebSocket broadcasting
+                        self.server.pending_alerts_queue.append(alert)
+                        print(f"[API] Alert added to broadcast queue. Queue size: {len(self.server.pending_alerts_queue)}")
                 
                 # Set the alert capture on LLM sink
                 if hasattr(self.video_system, 'llm_sink'):
@@ -555,7 +643,7 @@ class VideoAnalysisServer:
             
             # CRITICAL FIX: Replace web_display with AlertCapture wrapper AFTER VideoGatingSystem init
             print(f"[API DEBUG] Mode: {self.current_config.mode}, has llm_sink: {hasattr(self.video_system, 'llm_sink')}")
-            if self.current_config.mode == "alert" and hasattr(self.video_system, 'llm_sink'):
+            if self.current_config.mode in ["alert", "realtime_description"] and hasattr(self.video_system, 'llm_sink'):
                 print(f"[API DEBUG] Entering alert wrapper setup...")
                 class AlertCaptureWrapper:
                     def __init__(self, server, original_web_display):
@@ -565,6 +653,12 @@ class VideoAnalysisServer:
                     
                     def add_notification(self, message):
                         print(f"[API] AlertCaptureWrapper.add_notification called: {message}")
+                        
+                        # Skip creating complete alerts in streaming mode - only tokens should be sent
+                        if self.server.current_config.streaming_mode:
+                            print(f"[API] Skipping alert creation in streaming mode - only tokens are sent")
+                            return
+                        
                         alert = AlertNotification(
                             id=str(len(self.server.alerts)),
                             timestamp=datetime.now(),
@@ -573,6 +667,10 @@ class VideoAnalysisServer:
                         )
                         self.server.alerts.append(alert)
                         print(f"[API] Alert stored! Total alerts: {len(self.server.alerts)}")
+                        
+                        # Add to queue for WebSocket broadcasting
+                        self.server.pending_alerts_queue.append(alert)
+                        print(f"[API] Alert added to broadcast queue. Queue size: {len(self.server.pending_alerts_queue)}")
                         
                         # Also call original if it exists
                         if self.original_web_display and hasattr(self.original_web_display, 'add_notification'):
@@ -609,7 +707,7 @@ class VideoAnalysisServer:
             # Wait a moment for LLM workers to start, then apply the wrapper
             time.sleep(2)
             
-            if self.current_config.mode == "alert" and hasattr(self.video_system, 'llm_sink'):
+            if self.current_config.mode in ["alert", "realtime_description"] and hasattr(self.video_system, 'llm_sink'):
                 print(f"[API] Applying wrapper AFTER LLM workers started...")
                 
                 # Create a new wrapper
@@ -620,6 +718,12 @@ class VideoAnalysisServer:
                     
                     def add_notification(self, message):
                         print(f"[API] DelayedAlertWrapper.add_notification: {message}")
+                        
+                        # Skip creating complete alerts in streaming mode - only tokens should be sent
+                        if hasattr(self.server, 'current_config') and self.server.current_config.streaming_mode:
+                            print(f"[API] Skipping alert creation in streaming mode - only tokens are sent")
+                            return
+                        
                         alert = AlertNotification(
                             id=str(len(self.server.alerts)),
                             timestamp=datetime.now(),
@@ -628,6 +732,19 @@ class VideoAnalysisServer:
                         )
                         self.server.alerts.append(alert)
                         print(f"[API] ALERT STORED! Total: {len(self.server.alerts)}")
+                        
+                        # Add to queue for WebSocket broadcasting
+                        self.server.pending_alerts_queue.append(alert)
+                        print(f"[API] Alert added to broadcast queue. Queue size: {len(self.server.pending_alerts_queue)}")
+                    
+                    def send_streaming_token(self, token):
+                        """Handle streaming tokens from Gemini."""
+                        print(f"[API] 🎪 DelayedAlertWrapper.send_streaming_token: '{token}'")
+                        self.server.pending_token_queue.append({
+                            'token': token,
+                            'timestamp': time.time()
+                        })
+                        print(f"[API] ✅ Token added to queue! Queue size: {len(self.server.pending_token_queue)}")
                     
                     def __getattr__(self, name):
                         # For any other attributes, return a dummy function

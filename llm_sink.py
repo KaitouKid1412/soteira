@@ -14,6 +14,8 @@ import openai
 from typing import Optional
 import cv2
 import numpy as np
+import google.generativeai as genai
+import os
 
 from utils.prompt_transformer import LLMPromptTransformer, SimplePromptTransformer
 
@@ -33,15 +35,15 @@ def extract_image_features_fast(image_source) -> np.ndarray:
         if isinstance(image_source, str):
             img = cv2.imread(image_source)
             if img is None:
-                return np.zeros(64)  # Much smaller fallback
+                return np.zeros(36)  # Ultra small for speed  # Much smaller fallback
         else:
             # Assume it's already a cv2 image array
             img = image_source
             if img is None or img.size == 0:
-                return np.zeros(64)
+                return np.zeros(36)  # Ultra small for speed
         
-        # Super small resize for speed (8x8 = 64 pixels)
-        img_tiny = cv2.resize(img, (8, 8))
+        # Ultra small resize for maximum speed (6x6 = 36 pixels)
+        img_tiny = cv2.resize(img, (6, 6))
         
         # Convert to grayscale for speed
         img_gray = cv2.cvtColor(img_tiny, cv2.COLOR_BGR2GRAY)
@@ -58,31 +60,53 @@ def extract_image_features_fast(image_source) -> np.ndarray:
         return features
         
     except Exception as e:
-        return np.zeros(64)
+        return np.zeros(36)  # Ultra small for speed
 
 
-def encode_image_to_base64(image_source) -> str:
-    """Encode image to base64 for OpenAI API.
+def encode_image_to_base64(image_source, max_size: int = 512, quality: int = 75) -> str:
+    """Encode image to base64 for OpenAI API with compression and resizing.
     
     Args:
         image_source: Either file path (str) or cv2 image array (numpy.ndarray)
+        max_size: Maximum dimension (width or height) for resizing
+        quality: JPEG compression quality (1-100, lower = smaller file)
     """
+    import cv2
+    
+    # Load image
     if isinstance(image_source, str):
         # File path provided
-        with open(image_source, "rb") as image_file:
-            return base64.b64encode(image_file.read()).decode('utf-8')
+        img = cv2.imread(image_source)
+        if img is None:
+            raise Exception(f"Failed to load image from {image_source}")
     else:
         # Numpy array provided (cv2 image)
-        import cv2
-        # Encode image to JPEG in memory
-        success, buffer = cv2.imencode('.jpg', image_source)
-        if not success:
-            raise Exception("Failed to encode image to JPEG")
-        return base64.b64encode(buffer).decode('utf-8')
+        img = image_source
+        if img is None:
+            raise Exception("Invalid image array provided")
+    
+    # Resize image if too large (for faster API processing)
+    height, width = img.shape[:2]
+    if max(height, width) > max_size:
+        if height > width:
+            new_height = max_size
+            new_width = int(width * (max_size / height))
+        else:
+            new_width = max_size
+            new_height = int(height * (max_size / width))
+        img = cv2.resize(img, (new_width, new_height), interpolation=cv2.INTER_AREA)
+    
+    # Encode with compression
+    encode_params = [cv2.IMWRITE_JPEG_QUALITY, quality]
+    success, buffer = cv2.imencode('.jpg', img, encode_params)
+    if not success:
+        raise Exception("Failed to encode image to JPEG")
+    
+    return base64.b64encode(buffer).decode('utf-8')
 
 
 def send_to_openai_vision(prompt: str, image_source, api_key: str, 
-                         model: str = "gpt-4o") -> dict:
+                         model: str = "gpt-4o", use_fast_model: bool = False) -> dict:
     """
     Send image and prompt to OpenAI GPT-4 Vision API.
     
@@ -96,11 +120,19 @@ def send_to_openai_vision(prompt: str, image_source, api_key: str,
         API response dict
     """
     try:
-        # Encode image
-        base64_image = encode_image_to_base64(image_source)
+        # Encode image with optimization for speed
+        base64_image = encode_image_to_base64(image_source, max_size=512, quality=75)
         
-        # Initialize OpenAI client
-        client = openai.OpenAI(api_key=api_key)
+        # Use faster model for high-load scenarios
+        if use_fast_model:
+            model = "gpt-4o-mini"  # Faster, cheaper alternative
+        
+        # Initialize OpenAI client with connection pooling and optimizations
+        client = openai.OpenAI(
+            api_key=api_key,
+            timeout=10.0,  # Reduced timeout for faster failure detection
+            max_retries=2   # Reduced retries for speed
+        )
         
         # Prepare payload
         response = client.chat.completions.create(
@@ -119,8 +151,8 @@ def send_to_openai_vision(prompt: str, image_source, api_key: str,
                     ]
                 }
             ],
-            max_tokens=500,
-            temperature=0.1  # Low temperature for consistent analysis
+            max_tokens=100,  # Reduced for faster, more reliable responses
+            temperature=0.0  # Zero temperature for fastest, most consistent responses
         )
         
         # Convert to dict format
@@ -171,6 +203,129 @@ def send_to_openai_vision(prompt: str, image_source, api_key: str,
         }
 
 
+def call_gemini_streaming(image_source, prompt: str, model, web_display=None) -> dict:
+    """
+    Call Gemini Flash 2.5 with streaming support for real-time token delivery.
+    
+    Args:
+        image_source: Image file path or PIL Image
+        prompt: Text prompt for analysis
+        model: Gemini model instance
+        web_display: Display interface for streaming tokens
+        
+    Returns:
+        API response dict (accumulated from stream)
+    """
+    try:
+        # Encode image for Gemini
+        if isinstance(image_source, str):
+            # Read image file
+            import PIL.Image
+            import os
+            if not os.path.exists(image_source):
+                raise FileNotFoundError(f"Image file not found: {image_source}")
+            image = PIL.Image.open(image_source)
+        elif hasattr(image_source, 'shape'):
+            # Convert numpy array (cv2 image) to PIL Image
+            import cv2
+            import PIL.Image
+            # Convert BGR to RGB for PIL
+            rgb_image = cv2.cvtColor(image_source, cv2.COLOR_BGR2RGB)
+            image = PIL.Image.fromarray(rgb_image)
+        else:
+            # Assume it's already a PIL Image
+            image = image_source
+            
+        print(f"[GEMINI] Starting streaming request...")
+        
+        # Configure generation settings for consistent output
+        import google.generativeai as genai
+        generation_config = genai.types.GenerationConfig(
+            temperature=0.0,  # Zero temperature for consistent, reliable descriptions
+            max_output_tokens=150,  # Limit for faster streaming
+            top_p=0.8
+        )
+        
+        # Start streaming generation with config
+        response_stream = model.generate_content(
+            [prompt, image],
+            stream=True,
+            generation_config=generation_config
+        )
+        
+        # Accumulate full response and stream tokens
+        full_content = ""
+        token_count = 0
+        start_time = time.time()
+        
+        for chunk in response_stream:
+            if chunk.text:
+                full_content += chunk.text
+                token_count += 1
+                
+                # Send streaming token to frontend via web_display
+                if web_display and hasattr(web_display, 'send_streaming_token'):
+                    web_display.send_streaming_token(chunk.text)
+                elif web_display:
+                    # Fallback: send token via pending queue for WebSocket
+                    if hasattr(web_display, 'server') and hasattr(web_display.server, 'pending_token_queue'):
+                        web_display.server.pending_token_queue.append({
+                            'token': chunk.text,
+                            'timestamp': time.time()
+                        })
+                        print(f"[GEMINI] Token added to queue: '{chunk.text}'")
+                    else:
+                        print(f"[GEMINI] Warning: No token queue available")
+                
+                print(f"[GEMINI] Token {token_count}: {chunk.text}", end='', flush=True)
+        
+        elapsed = time.time() - start_time
+        print(f"\n[GEMINI] ✓ Streaming complete: {token_count} tokens in {elapsed:.2f}s")
+        
+        # Return OpenAI-compatible response format
+        result = {
+            "id": f"gemini-{int(time.time())}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": "gemini-2.0-flash-exp",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": full_content
+                    },
+                    "finish_reason": "stop"
+                }
+            ],
+            "usage": {
+                "prompt_tokens": len(prompt.split()),  # Rough estimate
+                "completion_tokens": token_count,
+                "total_tokens": len(prompt.split()) + token_count
+            }
+        }
+        
+        return result
+        
+    except Exception as e:
+        print(f"[GEMINI] ✗ Streaming error: {e}")
+        return {
+            "error": str(e),
+            "id": f"gemini-error-{int(time.time())}",
+            "created": int(time.time()),
+            "model": "gemini-2.0-flash-exp",
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant", 
+                        "content": f"Error with Gemini streaming: {e}"
+                    },
+                    "finish_reason": "error"
+                }
+            ]
+        }
+
+
 def send_to_gpt_stub(prompt: str, image_path: str) -> dict:
     """
     Stub function for testing without API calls.
@@ -213,9 +368,10 @@ class LLMSink:
     """Background processor for LLM API calls with parallel processing and rate limit handling."""
     
     def __init__(self, user_query: str, openai_api_key: Optional[str] = None, 
-                 dry_run: bool = False, max_queue_size: int = 100, num_workers: int = 4,
-                 similarity_threshold: float = 0.90, debug_mode: bool = False,
-                 mode: str = "summary", web_display=None):
+                 dry_run: bool = False, max_queue_size: int = 200, num_workers: int = 8,
+                 similarity_threshold: float = 0.75, debug_mode: bool = False,
+                 mode: str = "summary", web_display=None, streaming_mode: bool = False,
+                 gemini_api_key: Optional[str] = None):
         """
         Initialize LLM sink.
         
@@ -223,11 +379,13 @@ class LLMSink:
             user_query: Original user query (e.g., "find humans", "check for cigarettes")
             openai_api_key: OpenAI API key (None for stub mode)
             dry_run: If True, don't actually call LLM (just log)
-            max_queue_size: Maximum number of queued requests
-            num_workers: Number of parallel worker threads
-            similarity_threshold: Cosine similarity threshold (0.9 = 90% similar = skip)
+            max_queue_size: Maximum number of queued requests (increased for better throughput)
+            num_workers: Number of parallel worker threads (optimized for real-time processing)
+            similarity_threshold: Cosine similarity threshold (0.75 = 75% similar = skip, optimized for speed)
             debug_mode: Enable verbose debug logging
-            mode: Processing mode ('summary' or 'alert')
+            mode: Processing mode ('summary', 'alert', or 'realtime_description')
+            streaming_mode: Enable token streaming for real-time updates
+            gemini_api_key: Google Gemini API key for Gemini Flash 2.5
         """
         self.user_query = user_query
         self.openai_api_key = openai_api_key
@@ -237,6 +395,19 @@ class LLMSink:
         self.debug_mode = debug_mode
         self.mode = mode
         self.web_display = web_display
+        self.streaming_mode = streaming_mode
+        self.gemini_api_key = gemini_api_key
+        
+        # Initialize Gemini client if API key provided
+        self.gemini_model = None
+        if gemini_api_key:
+            try:
+                genai.configure(api_key=gemini_api_key)
+                self.gemini_model = genai.GenerativeModel('gemini-2.0-flash-exp')
+                print(f"[GEMINI] Initialized Gemini Flash 2.5 model")
+            except Exception as e:
+                print(f"[GEMINI] Failed to initialize Gemini: {e}")
+                self.gemini_model = None
         
         # Response collection for summary mode
         self.collected_responses = []  # List of (timestamp, image_path, response_content)
@@ -245,9 +416,30 @@ class LLMSink:
         # Alert tracking
         self.alert_count = 0
         
+        # Real-time description tracking
+        self.last_description_timestamp = 0.0
+        self.description_interval_ms = 3000  # 3 seconds between descriptions
+        self.last_scene_description = ""  # Store last description for context
+        self.description_context_history = []  # Store recent descriptions for context (max 5)
+        
         # Image similarity tracking - maintain history of sent images
         self.sent_image_features = []  # List of all sent image features
         self.max_history_size = 100    # Keep last 100 sent images for comparison
+        
+        # Temporal deduplication - skip frames too close in time
+        self.last_sent_timestamp = 0.0  # Timestamp of last sent frame
+        # Adjust temporal threshold based on mode and streaming
+        if mode == "realtime_description":
+            if streaming_mode:
+                self.temporal_threshold_ms = 800  # 0.8 seconds for streaming mode (much faster)
+            else:
+                self.temporal_threshold_ms = 2500  # 2.5 seconds for standard real-time descriptions
+        else:
+            self.temporal_threshold_ms = 500  # Minimum time between frames (ms)
+        
+        # Motion-based prioritization
+        self.motion_threshold_high = 0.1   # High motion threshold for priority
+        self.motion_threshold_low = 0.02   # Low motion threshold for skipping
         self.similarity_stats = {
             'total_requested': 0,
             'skipped_similar': 0,
@@ -286,6 +478,10 @@ class LLMSink:
         self.rate_limit_backoff = 0  # Seconds to wait due to rate limiting
         self.last_rate_limit = 0     # Timestamp of last rate limit
         self.rate_limit_lock = threading.Lock()
+        
+        # Model fallback for high load scenarios
+        self.queue_high_threshold = max_queue_size * 0.8  # 80% full = use fast model
+        self.use_fast_model_fallback = True
         
         # Statistics
         self.requests_processed = 0
@@ -385,10 +581,26 @@ class LLMSink:
                         
                         response = send_to_gpt_stub(self.image_prompt, image_path)
                     else:
-                        # Use real API or stub based on setup
-                        if self.use_real_api and self.openai_api_key:
-                            response = self._call_openai_with_retry(image_path, frame_data, worker_id)
+                        # Choose LLM API based on streaming mode and available keys
+                        print(f"[LLM-{worker_id}] STREAMING CHECK: streaming_mode={self.streaming_mode}, gemini_model={self.gemini_model is not None}")
+                        if self.streaming_mode and self.gemini_model:
+                            # Use Gemini Flash 2.5 for streaming
+                            print(f"[LLM-{worker_id}] ✅ Using Gemini Flash 2.5 streaming mode")
+                            # Use frame_data if available to avoid file I/O race conditions
+                            image_source = frame_data if frame_data is not None else image_path
+                            
+                            # Create a plain text prompt for streaming (no JSON format)
+                            streaming_prompt = "Describe what you see in this scene for a blind person. Keep it concise and conversational. Focus on people, objects, and activities. Respond with plain text only, no JSON format."
+                            response = call_gemini_streaming(image_source, streaming_prompt, self.gemini_model, self.web_display)
+                        elif self.use_real_api and self.openai_api_key:
+                            # Use OpenAI API with smart model selection
+                            current_queue_size = self.get_queue_size()
+                            use_fast = self.use_fast_model_fallback and current_queue_size > self.queue_high_threshold
+                            if use_fast and self.debug_mode:
+                                print(f"[FAST_MODEL] Using gpt-4o-mini due to high queue ({current_queue_size}/{self.max_queue_size})")
+                            response = self._call_openai_with_retry(image_path, frame_data, worker_id, use_fast_model=use_fast)
                         else:
+                            # Fallback to stub mode
                             response = send_to_gpt_stub(self.image_prompt, image_path)
                     
                     # Update cost tracking (only for real API calls)
@@ -413,7 +625,7 @@ class LLMSink:
                 print(f"[LLM-{worker_id}] Worker loop error: {e}")
                 time.sleep(0.1)
     
-    def _call_openai_with_retry(self, image_path: str, frame_data, worker_id: int, max_retries: int = 3) -> dict:
+    def _call_openai_with_retry(self, image_path: str, frame_data, worker_id: int, max_retries: int = 2, use_fast_model: bool = False) -> dict:
         """Call OpenAI API with retry logic for rate limiting.
         
         Args:
@@ -421,6 +633,7 @@ class LLMSink:
             frame_data: Image data as numpy array (preferred) or None to use file path
             worker_id: Worker thread ID for logging
             max_retries: Maximum number of retries
+            use_fast_model: Whether to use faster gpt-4o-mini model for speed
             
         Returns:
             dict: API response
@@ -429,7 +642,21 @@ class LLMSink:
             try:
                 # Use frame_data if available, otherwise fall back to image_path
                 image_source = frame_data if frame_data is not None else image_path
-                response = send_to_openai_vision(self.image_prompt, image_source, self.openai_api_key)
+                
+                # For realtime_description mode, enhance prompt with context
+                prompt_to_use = self.image_prompt
+                if self.mode == "realtime_description" and self.description_context_history:
+                    # Add context from previous descriptions
+                    context_text = " | ".join(self.description_context_history[-3:])  # Last 3 descriptions
+                    enhanced_prompt = self.image_prompt.replace(
+                        "This is a frame from a live video stream.", 
+                        f"This is a frame from a live video stream. Previous descriptions: [{context_text}]."
+                    )
+                    prompt_to_use = enhanced_prompt
+                    if self.debug_mode:
+                        print(f"[REALTIME_DESC] Using context with {len(self.description_context_history)} previous descriptions")
+                
+                response = send_to_openai_vision(prompt_to_use, image_source, self.openai_api_key, use_fast_model=use_fast_model)
                 return response
                 
             except Exception as e:
@@ -439,8 +666,8 @@ class LLMSink:
                 if "rate limit" in error_str or "quota" in error_str or "429" in error_str:
                     self.requests_rate_limited += 1
                     
-                    # Extract wait time from error if possible, otherwise use exponential backoff
-                    wait_time = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s
+                    # Extract wait time from error if possible, otherwise use faster backoff
+                    wait_time = min(1.0 + (attempt * 0.5), 3.0)  # Linear backoff: 1.5s, 2s, 2.5s (max 3s)
                     
                     # Try to extract wait time from error message
                     if "try again in" in error_str:
@@ -492,8 +719,11 @@ class LLMSink:
         Returns:
             str: LLM-synthesized answer to the original user question
         """
-        if self.mode != "summary":
+        if self.mode not in ["summary", "realtime_description"]:
             return f"Summary not available in {self.mode} mode"
+        
+        if self.mode == "realtime_description":
+            return f"Current scene: {self.last_scene_description}" if self.last_scene_description else "No scene description available"
         
         if not self.collected_responses:
             return "No responses collected for summary"
@@ -587,15 +817,19 @@ Respond in a natural, conversational way as if answering the user directly."""
             # Call LLM for synthesis (if available)
             if self.use_real_api and self.openai_api_key and not self.dry_run:
                 try:
-                    client = openai.OpenAI(api_key=self.openai_api_key)
+                    client = openai.OpenAI(
+                        api_key=self.openai_api_key,
+                        timeout=10.0,  # Faster timeout for synthesis
+                        max_retries=1   # Single retry for synthesis to maintain speed
+                    )
                     response = client.chat.completions.create(
                         model="gpt-4",  # Use GPT-4 for better synthesis
                         messages=[
                             {"role": "system", "content": "You are a helpful video analysis assistant that synthesizes multiple frame observations into coherent answers."},
                             {"role": "user", "content": synthesis_prompt}
                         ],
-                        max_tokens=500,
-                        temperature=0.1
+                        max_tokens=200,  # Slightly higher for synthesis but still optimized
+                        temperature=0.0
                     )
                     
                     synthesis_answer = response.choices[0].message.content.strip()
@@ -714,15 +948,60 @@ The user appears to be engaged in {', '.join(unique_activities[:3]) if unique_ac
                 elif "```" in clean_content:
                     clean_content = clean_content.split("```")[1].strip()
                 
+                # Handle incomplete JSON by trying to complete it
+                if clean_content.startswith('{') and not clean_content.endswith('}'):
+                    # Try to find the last complete field
+                    if '"analysis"' in clean_content:
+                        # Extract the analysis content
+                        analysis_start = clean_content.find('"analysis"')
+                        analysis_content = clean_content[analysis_start:]
+                        if '":' in analysis_content:
+                            analysis_value = analysis_content.split('":')[1].strip()
+                            if analysis_value.startswith('"'):
+                                # Try to find the end of the string
+                                analysis_value = analysis_value[1:]  # Remove opening quote
+                                # Find the last quote before any truncation
+                                if '"' in analysis_value:
+                                    analysis_text = analysis_value.split('"')[0]
+                                else:
+                                    analysis_text = analysis_value.rstrip(',')
+                                
+                                # Create a valid JSON response
+                                clean_content = f'{{"analysis": "{analysis_text}", "confidence": 0.8}}'
+                
                 parsed_response = json.loads(clean_content)
                 if self.debug_mode:
                     print(f"[ALERT DEBUG] Parsed JSON successfully: {parsed_response}")
             except Exception as e:
-                # If not JSON, treat as plain text
-                parsed_response = {"raw_response": llm_content}
+                # If JSON parsing fails, try to extract analysis from raw text
+                analysis_match = None
+                if '"analysis"' in llm_content:
+                    try:
+                        # Try to extract analysis text manually
+                        analysis_part = llm_content.split('"analysis"')[1]
+                        if '":' in analysis_part:
+                            analysis_content = analysis_part.split('":')[1].strip()
+                            if analysis_content.startswith('"'):
+                                analysis_content = analysis_content[1:]
+                                # Find end of string value
+                                end_pos = analysis_content.find('",')
+                                if end_pos == -1:
+                                    end_pos = analysis_content.find('"')
+                                if end_pos > 0:
+                                    analysis_match = analysis_content[:end_pos]
+                    except:
+                        pass
+                
+                if analysis_match:
+                    parsed_response = {"analysis": analysis_match, "confidence": 0.7}
+                    print(f"[ALERT DEBUG] Extracted analysis from malformed JSON: {analysis_match[:100]}...")
+                else:
+                    # If not JSON, treat as plain text
+                    parsed_response = {"analysis": llm_content, "confidence": 0.5}
+                    
                 if self.debug_mode:
                     print(f"[ALERT DEBUG] JSON parsing failed: {e}")
-                    print(f"[ALERT DEBUG] Cleaned content was: {clean_content[:100] if 'clean_content' in locals() else 'N/A'}...")
+                    print(f"[ALERT DEBUG] Using fallback parsing")
             
             timestamp = time.time()
             
@@ -766,8 +1045,8 @@ The user appears to be engaged in {', '.join(unique_activities[:3]) if unique_ac
                         self.web_display.add_notification(notification_message)
                         print(f"[LLM DEBUG] Notification sent successfully")
                     
-            elif self.mode == "summary":
-                # Collect responses for summary
+            # Collect responses for Q&A in both alert and summary modes (not realtime_description)
+            if self.mode in ["alert", "summary"]:
                 with self.response_lock:
                     self.collected_responses.append({
                         'timestamp': timestamp,
@@ -775,13 +1054,102 @@ The user appears to be engaged in {', '.join(unique_activities[:3]) if unique_ac
                         'response': parsed_response,
                         'raw_content': llm_content
                     })
+            
+            elif self.mode == "realtime_description":
+                # Real-time scene description for accessibility
+                # In this mode, we treat every description as an "alert" that should be spoken
+                if parsed_response.get('analysis'):
+                    description = parsed_response['analysis']
+                    current_time = time.time()
+                    
+                    # Intelligent scene change detection
+                    should_speak = True
+                    
+                    if self.last_scene_description:
+                        # Calculate similarity between descriptions
+                        similarity_score = self._calculate_description_similarity(
+                            description, self.last_scene_description
+                        )
+                        
+                        time_since_last = current_time - self.last_description_timestamp
+                        
+                        # Only speak if significant change or enough time has passed
+                        if similarity_score > 0.8 and time_since_last < 10:  # Very similar and recent
+                            should_speak = False
+                            print(f"[REALTIME_DESC] Skipping similar description (similarity: {similarity_score:.2f})")
+                        elif similarity_score > 0.6:  # Somewhat similar - highlight changes
+                            changes = self._extract_changes(description, self.last_scene_description)
+                            if changes:
+                                description = f"Changes: {changes}"
+                            else:
+                                should_speak = False
+                        # If similarity < 0.6, it's a significant change - speak the full new description
+                    
+                    if should_speak:
+                        # Store current description for next comparison
+                        self.last_scene_description = description
+                        self.last_description_timestamp = current_time
+                        
+                        # Add to context history for future prompts (keep last 5)
+                        self.description_context_history.append(description)
+                        if len(self.description_context_history) > 5:
+                            self.description_context_history.pop(0)  # Remove oldest
+                        
+                        # Create an alert-style notification for TTS
+                        # This uses the same mechanism as the alert system
+                        print(f"[REALTIME_DESC] Creating accessibility notification")
+                        print(f"[REALTIME_DESC] web_display exists: {self.web_display is not None}")
+                        print(f"[REALTIME_DESC] web_display type: {type(self.web_display)}")
+                        if self.web_display:
+                            print(f"[REALTIME_DESC] Sending description: {description}")
+                            self.web_display.add_notification(description)
+                            print(f"[REALTIME_DESC] add_notification call completed")
+                        else:
+                            print(f"[REALTIME_DESC] ERROR: web_display is None - cannot send notification!")
                     
                     if self.debug_mode:
-                        print(f"[SUMMARY] Collected response #{len(self.collected_responses)} from {Path(image_path).name}")
+                        print(f"[REALTIME_DESC] Scene description: {description}")
                         
         except Exception as e:
             if self.debug_mode:
                 print(f"[RESPONSE] Error processing response: {e}")
+    
+    def _calculate_description_similarity(self, desc1: str, desc2: str) -> float:
+        """Calculate similarity between two descriptions using simple word overlap."""
+        if not desc1 or not desc2:
+            return 0.0
+            
+        # Simple word-based similarity
+        words1 = set(desc1.lower().split())
+        words2 = set(desc2.lower().split())
+        
+        if not words1 or not words2:
+            return 0.0
+            
+        intersection = words1.intersection(words2)
+        union = words1.union(words2)
+        
+        return len(intersection) / len(union)
+    
+    def _extract_changes(self, new_desc: str, old_desc: str) -> str:
+        """Extract key differences between descriptions."""
+        if not new_desc or not old_desc:
+            return new_desc
+            
+        # Simple approach: find new key words/phrases
+        old_words = set(old_desc.lower().split())
+        new_words = set(new_desc.lower().split())
+        
+        # Find significant new words (not common words)
+        common_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'is', 'are', 'was', 'were', 'been', 'be', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should', 'may', 'might', 'can', 'this', 'that', 'these', 'those'}
+        
+        new_significant_words = (new_words - old_words) - common_words
+        
+        if new_significant_words and len(new_significant_words) <= 10:  # Reasonable number of changes
+            return f"New activity detected: {' '.join(sorted(new_significant_words))}"
+        
+        # If too many changes, return the new description
+        return new_desc
     
     def _save_analysis(self, image_path: str, response: dict):
         """
@@ -869,19 +1237,46 @@ The user appears to be engaged in {', '.join(unique_activities[:3]) if unique_ac
         except Exception as e:
             print(f"[LLM] Error logging sent image: {e}")
     
-    def enqueue_to_llm(self, prompt, image_path, frame_data=None):
+    def enqueue_to_llm(self, prompt, image_path, frame_data=None, motion_ratio=None):
         """
-        Enqueue an LLM request for background processing. Similarity checking moved to worker threads.
+        Enqueue an LLM request for background processing with smart prioritization.
         
         Args:
             prompt: Text prompt to send
             image_path: Path to image file
             frame_data: Optional cv2 image array (to avoid race condition with file I/O)
+            motion_ratio: Optional motion ratio for prioritization (0.0-1.0)
             
         Returns:
-            bool: True if successfully queued, False if queue is full
+            bool: True if successfully queued, False if dropped (queue full, temporal skip, or low priority)
         """
         self.similarity_stats['total_requested'] += 1
+        
+        # Smart motion-based filtering
+        if motion_ratio is not None:
+            # Skip very low motion frames to reduce processing load
+            if motion_ratio < self.motion_threshold_low:
+                if self.debug_mode and self.similarity_stats['total_requested'] <= 10:
+                    print(f"[MOTION] Skipped low motion frame ({motion_ratio:.3f} < {self.motion_threshold_low})")
+                return False
+            
+            # For high motion frames, reduce temporal threshold for more responsive processing
+            temporal_threshold = self.temporal_threshold_ms
+            if motion_ratio > self.motion_threshold_high:
+                temporal_threshold = max(250, self.temporal_threshold_ms // 2)  # Half the time for high motion
+        else:
+            temporal_threshold = self.temporal_threshold_ms
+        
+        # Temporal deduplication - skip frames too close in time
+        current_time = time.time() * 1000  # Convert to milliseconds
+        if current_time - self.last_sent_timestamp < temporal_threshold:
+            if self.debug_mode and self.similarity_stats['total_requested'] <= 10:
+                time_diff = current_time - self.last_sent_timestamp
+                print(f"[TEMPORAL] Skipped frame - too soon ({time_diff:.0f}ms < {temporal_threshold:.0f}ms)")
+            return False
+        
+        # Update timestamp for temporal tracking
+        self.last_sent_timestamp = current_time
         
         # DEBUG: Always print first few calls
         if self.debug_mode and self.similarity_stats['total_requested'] <= 5:
@@ -1011,6 +1406,109 @@ The user appears to be engaged in {', '.join(unique_activities[:3]) if unique_ac
         except Exception as e:
             print(f"[LLM] Error waiting for completion: {e}")
             return False
+    
+    def answer_question(self, question: str) -> str:
+        """
+        Answer a user question based on collected responses from the current video session.
+        
+        Args:
+            question: The user's question about the video
+            
+        Returns:
+            str: LLM-generated answer based on collected video analysis
+        """
+        if self.mode not in ["alert", "summary"]:
+            return f"Q&A not available in {self.mode} mode - only available in alert and summary modes"
+        
+        if not self.collected_responses:
+            return "No video analysis data available to answer questions. Process a video first."
+            
+        try:
+            # Sort responses by timestamp
+            sorted_responses = sorted(self.collected_responses, key=lambda x: x['timestamp'])
+            
+            print(f"[Q&A] Processing question using {len(sorted_responses)} collected responses")
+            
+            # Create context from collected responses
+            response_summaries = []
+            for i, item in enumerate(sorted_responses[:50]):  # Limit to 50 responses for performance
+                response = item['response']
+                raw_content = item.get('raw_content', '')
+                timestamp_str = datetime.fromtimestamp(item['timestamp']).strftime('%H:%M:%S')
+                
+                # Extract meaningful content
+                if isinstance(response, dict) and response:
+                    summary_parts = []
+                    for key in ['action', 'analysis', 'detailed_description', 'items_found', 'items']:
+                        if key in response and response[key]:
+                            summary_parts.append(f"{key}: {response[key]}")
+                    
+                    if summary_parts:
+                        response_summaries.append(f"[{timestamp_str}] {' | '.join(summary_parts)}")
+                elif raw_content:
+                    response_summaries.append(f"[{timestamp_str}] {raw_content[:150]}")
+            
+            if not response_summaries:
+                return "No meaningful analysis data available to answer the question."
+            
+            # Create Q&A prompt
+            context_text = chr(10).join(response_summaries)
+            
+            qa_prompt = f"""You are analyzing video content. A user is asking a question about a video that has been processed and analyzed.
+
+QUESTION: "{question}"
+
+VIDEO ANALYSIS DATA:
+The following are timestamped analyses from the video:
+
+{context_text}
+
+Based on this video analysis data, provide a comprehensive answer to the user's question. Focus on:
+1. Direct answer to the question
+2. Specific examples from the video timestamps
+3. Relevant details that support your answer
+4. If the question cannot be answered from the available data, clearly state what information is missing
+
+Answer naturally and conversationally."""
+
+            # Call LLM for Q&A (if available)
+            if self.use_real_api and self.openai_api_key and not self.dry_run:
+                try:
+                    import openai
+                    client = openai.OpenAI(
+                        api_key=self.openai_api_key,
+                        timeout=15.0,
+                        max_retries=1
+                    )
+                    response = client.chat.completions.create(
+                        model="gpt-4o",  # Use GPT-4o for better Q&A
+                        messages=[
+                            {"role": "system", "content": "You are a helpful video analysis assistant that answers questions based on provided video analysis data."},
+                            {"role": "user", "content": qa_prompt}
+                        ],
+                        max_tokens=400,
+                        temperature=0.1
+                    )
+                    
+                    answer = response.choices[0].message.content.strip()
+                    
+                    # Format the final answer
+                    final_answer = f"""Q: {question}
+
+A: {answer}
+
+[Based on analysis of {len(sorted_responses)} video frames]"""
+                    
+                    return final_answer
+                    
+                except Exception as e:
+                    print(f"[Q&A] Error calling LLM: {e}")
+                    return f"Error generating answer: {e}. Try again or check API configuration."
+            else:
+                return "Q&A requires real API access. Enable real LLM calls to use this feature."
+                
+        except Exception as e:
+            return f"Error processing question: {e}"
     
     def shutdown(self, wait_for_completion=True, timeout=10):
         """
