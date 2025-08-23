@@ -48,9 +48,15 @@ class SoteiraApp {
         // Mode-specific sections
         this.alertsSection = document.getElementById('alertsSection');
         this.summarySection = document.getElementById('summarySection');
+        this.qaSection = document.getElementById('qaSection');
         this.alertsList = document.getElementById('alertsList');
         this.summaryLoading = document.getElementById('summaryLoading');
         this.summaryText = document.getElementById('summaryText');
+        
+        // Q&A elements
+        this.questionInput = document.getElementById('questionInput');
+        this.askBtn = document.getElementById('askBtn');
+        this.qaHistory = document.getElementById('qaHistory');
         
         // TTS controls
         this.ttsToggle = document.getElementById('ttsToggle');
@@ -239,6 +245,7 @@ class SoteiraApp {
                 this.updateControlsState();
                 this.showVideoLoader(); // Show loading state
                 this.clearAlerts();
+                this.clearQAHistory(); // Clear previous Q&A when starting new video
                 this.lastAlertCheck = 0; // Reset alert counter
                 this.updateModeDisplay(config.mode);
                 
@@ -288,6 +295,9 @@ class SoteiraApp {
                 // Hide mode displays
                 this.alertsSection.style.display = 'none';
                 this.summarySection.style.display = 'none';
+                if (this.qaSection) {
+                    this.qaSection.style.display = 'none';
+                }
                 
                 // Reset to placeholder state
                 this.showVideoPlaceholder();
@@ -463,17 +473,32 @@ class SoteiraApp {
                 this.ttsToggle.checked = true;
                 this.ttsEnabled = true;
             }
+            
+            // Show Q&A for alert mode only (not realtime_description)
+            if (mode === 'alert' && this.qaSection) {
+                this.qaSection.style.display = 'block';
+            } else if (this.qaSection) {
+                this.qaSection.style.display = 'none';
+            }
         } else if (mode === 'summary') {
             this.alertsSection.style.display = 'none';
             this.summarySection.style.display = 'block';
             if (this.streamingDisplay) {
                 this.streamingDisplay.style.display = 'none';
             }
+            
+            // Show Q&A for summary mode
+            if (this.qaSection) {
+                this.qaSection.style.display = 'block';
+            }
         } else {
             this.alertsSection.style.display = 'none';
             this.summarySection.style.display = 'none';
             if (this.streamingDisplay) {
                 this.streamingDisplay.style.display = 'none';
+            }
+            if (this.qaSection) {
+                this.qaSection.style.display = 'none';
             }
         }
     }
@@ -877,12 +902,136 @@ class SoteiraApp {
             this.updateStreamingDisplay(); // Refresh display to show history
         }, 1000); // Reduced delay
     }
+
+    async askQuestion() {
+        const question = this.questionInput.value.trim();
+        if (!question) {
+            this.showNotification('Please enter a question', 'warning');
+            return;
+        }
+
+        // Check if we can ask questions
+        if (!this.isProcessing && (!this.alerts || this.alerts.length === 0)) {
+            this.showNotification('Process a video first before asking questions', 'warning');
+            return;
+        }
+
+        try {
+            // Show loading state
+            this.askBtn.disabled = true;
+            this.askBtn.textContent = 'Asking...';
+            
+            // Add loading indicator to Q&A history
+            this.addQAItem(question, null, true);
+
+            const response = await fetch('/ask_question', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({ question: question })
+            });
+
+            if (!response.ok) {
+                const errorData = await response.json();
+                throw new Error(errorData.detail || 'Failed to ask question');
+            }
+
+            const data = await response.json();
+            
+            // Remove loading indicator and add real Q&A
+            this.removeLoadingQA();
+            this.addQAItem(data.question, data.answer, false);
+            
+            // Clear input
+            this.questionInput.value = '';
+            
+            this.showNotification('Question answered successfully!', 'success');
+
+        } catch (error) {
+            console.error('Error asking question:', error);
+            this.removeLoadingQA();
+            this.showNotification(`Error: ${error.message}`, 'error');
+        } finally {
+            // Reset button state
+            this.askBtn.disabled = false;
+            this.askBtn.textContent = 'Ask Question';
+        }
+    }
+
+    addQAItem(question, answer, isLoading = false) {
+        // Remove no-qa message if it exists
+        const noQa = this.qaHistory.querySelector('.no-qa');
+        if (noQa) {
+            noQa.remove();
+        }
+
+        const qaItem = document.createElement('div');
+        qaItem.className = 'qa-item';
+
+        if (isLoading) {
+            qaItem.innerHTML = `
+                <div class="qa-question">${question}</div>
+                <div class="qa-loading">
+                    <div class="loading"></div>
+                    <span>Analyzing video data and generating answer...</span>
+                </div>
+            `;
+            qaItem.setAttribute('data-loading', 'true');
+        } else {
+            const timestamp = new Date().toLocaleTimeString();
+            qaItem.innerHTML = `
+                <div class="qa-question">Q: ${question}</div>
+                <div class="qa-answer">${answer}</div>
+                <div style="font-size: 0.8rem; color: #666; margin-top: 0.5rem; text-align: right;">
+                    ${timestamp}
+                </div>
+            `;
+        }
+
+        // Insert at the beginning (most recent first)
+        this.qaHistory.insertBefore(qaItem, this.qaHistory.firstChild);
+        
+        // Scroll to the new item
+        qaItem.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
+
+    removeLoadingQA() {
+        const loadingItem = this.qaHistory.querySelector('.qa-item[data-loading="true"]');
+        if (loadingItem) {
+            loadingItem.remove();
+        }
+    }
+
+    clearQAHistory() {
+        if (this.qaHistory) {
+            // Remove all Q&A items
+            const qaItems = this.qaHistory.querySelectorAll('.qa-item');
+            qaItems.forEach(item => item.remove());
+            
+            // Add back the no-qa message
+            const noQaMsg = document.createElement('div');
+            noQaMsg.className = 'no-qa';
+            noQaMsg.style.textAlign = 'center';
+            noQaMsg.style.color = '#999';
+            noQaMsg.style.padding = '2rem';
+            noQaMsg.style.fontStyle = 'italic';
+            noQaMsg.textContent = 'Process a video first, then ask questions about what you observed.';
+            this.qaHistory.appendChild(noQaMsg);
+        }
+    }
 }
 
 // Global functions
 function clearAlerts() {
     if (window.app) {
         window.app.clearAlerts();
+    }
+}
+
+function askQuestion() {
+    if (window.app) {
+        window.app.askQuestion();
     }
 }
 

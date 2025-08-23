@@ -62,6 +62,10 @@ class AlertNotification(BaseModel):
     frame_path: Optional[str] = None
 
 
+class QuestionRequest(BaseModel):
+    question: str
+
+
 class VideoAnalysisServer:
     def __init__(self):
         self.app = FastAPI(title="Soteira Video Analysis API", version="1.0.0")
@@ -164,7 +168,7 @@ class VideoAnalysisServer:
                 scene_hist=0.7,
                 scene_ssim=0.85,
                 buffer_frames=3,
-                similarity_threshold=0.7,
+                similarity_threshold=0.9,
                 disable_quality_filter=True,
                 skip_scene=True,
                 stop_on_good_frame=True
@@ -294,6 +298,24 @@ class VideoAnalysisServer:
                 summary = self.video_system.llm_sink.generate_synthesis_summary()
                 return {"summary": summary}
             return {"summary": "No summary available."}
+        
+        @self.app.post("/ask_question")
+        async def ask_question(request: QuestionRequest):
+            """Ask a question about the processed video."""
+            if not self.video_system or not hasattr(self.video_system, 'llm_sink'):
+                raise HTTPException(status_code=404, detail="No video processing system available")
+            
+            if not self.current_config:
+                raise HTTPException(status_code=400, detail="No video has been processed yet")
+            
+            if self.current_config.mode not in ["alert", "summary"]:
+                raise HTTPException(status_code=400, detail="Q&A only available in alert and summary modes")
+            
+            try:
+                answer = self.video_system.llm_sink.answer_question(request.question)
+                return {"question": request.question, "answer": answer}
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Error processing question: {str(e)}")
         
         @self.app.get("/video_feed")
         async def video_feed():

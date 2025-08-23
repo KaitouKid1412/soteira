@@ -1030,8 +1030,8 @@ The user appears to be engaged in {', '.join(unique_activities[:3]) if unique_ac
                         self.web_display.add_notification(notification_message)
                         print(f"[LLM DEBUG] Notification sent successfully")
                     
-            elif self.mode == "summary":
-                # Collect responses for summary
+            # Collect responses for Q&A in both alert and summary modes (not realtime_description)
+            if self.mode in ["alert", "summary"]:
                 with self.response_lock:
                     self.collected_responses.append({
                         'timestamp': timestamp,
@@ -1386,6 +1386,109 @@ The user appears to be engaged in {', '.join(unique_activities[:3]) if unique_ac
         except Exception as e:
             print(f"[LLM] Error waiting for completion: {e}")
             return False
+    
+    def answer_question(self, question: str) -> str:
+        """
+        Answer a user question based on collected responses from the current video session.
+        
+        Args:
+            question: The user's question about the video
+            
+        Returns:
+            str: LLM-generated answer based on collected video analysis
+        """
+        if self.mode not in ["alert", "summary"]:
+            return f"Q&A not available in {self.mode} mode - only available in alert and summary modes"
+        
+        if not self.collected_responses:
+            return "No video analysis data available to answer questions. Process a video first."
+            
+        try:
+            # Sort responses by timestamp
+            sorted_responses = sorted(self.collected_responses, key=lambda x: x['timestamp'])
+            
+            print(f"[Q&A] Processing question using {len(sorted_responses)} collected responses")
+            
+            # Create context from collected responses
+            response_summaries = []
+            for i, item in enumerate(sorted_responses[:50]):  # Limit to 50 responses for performance
+                response = item['response']
+                raw_content = item.get('raw_content', '')
+                timestamp_str = datetime.fromtimestamp(item['timestamp']).strftime('%H:%M:%S')
+                
+                # Extract meaningful content
+                if isinstance(response, dict) and response:
+                    summary_parts = []
+                    for key in ['action', 'analysis', 'detailed_description', 'items_found', 'items']:
+                        if key in response and response[key]:
+                            summary_parts.append(f"{key}: {response[key]}")
+                    
+                    if summary_parts:
+                        response_summaries.append(f"[{timestamp_str}] {' | '.join(summary_parts)}")
+                elif raw_content:
+                    response_summaries.append(f"[{timestamp_str}] {raw_content[:150]}")
+            
+            if not response_summaries:
+                return "No meaningful analysis data available to answer the question."
+            
+            # Create Q&A prompt
+            context_text = chr(10).join(response_summaries)
+            
+            qa_prompt = f"""You are analyzing video content. A user is asking a question about a video that has been processed and analyzed.
+
+QUESTION: "{question}"
+
+VIDEO ANALYSIS DATA:
+The following are timestamped analyses from the video:
+
+{context_text}
+
+Based on this video analysis data, provide a comprehensive answer to the user's question. Focus on:
+1. Direct answer to the question
+2. Specific examples from the video timestamps
+3. Relevant details that support your answer
+4. If the question cannot be answered from the available data, clearly state what information is missing
+
+Answer naturally and conversationally."""
+
+            # Call LLM for Q&A (if available)
+            if self.use_real_api and self.openai_api_key and not self.dry_run:
+                try:
+                    import openai
+                    client = openai.OpenAI(
+                        api_key=self.openai_api_key,
+                        timeout=15.0,
+                        max_retries=1
+                    )
+                    response = client.chat.completions.create(
+                        model="gpt-4o",  # Use GPT-4o for better Q&A
+                        messages=[
+                            {"role": "system", "content": "You are a helpful video analysis assistant that answers questions based on provided video analysis data."},
+                            {"role": "user", "content": qa_prompt}
+                        ],
+                        max_tokens=400,
+                        temperature=0.1
+                    )
+                    
+                    answer = response.choices[0].message.content.strip()
+                    
+                    # Format the final answer
+                    final_answer = f"""Q: {question}
+
+A: {answer}
+
+[Based on analysis of {len(sorted_responses)} video frames]"""
+                    
+                    return final_answer
+                    
+                except Exception as e:
+                    print(f"[Q&A] Error calling LLM: {e}")
+                    return f"Error generating answer: {e}. Try again or check API configuration."
+            else:
+                return "Q&A requires real API access. Enable real LLM calls to use this feature."
+                
+        except Exception as e:
+            return f"Error processing question: {e}"
     
     def shutdown(self, wait_for_completion=True, timeout=10):
         """

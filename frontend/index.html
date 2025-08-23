@@ -265,6 +265,56 @@
             font-style: italic;
         }
 
+        /* Q&A Section Styles */
+        .qa-section {
+            background: rgba(255, 255, 255, 0.8);
+            border-radius: 16px;
+            padding: 1.5rem;
+            border: 1px solid #e0e0e0;
+            backdrop-filter: blur(10px);
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+
+        .qa-header {
+            margin-bottom: 1.5rem;
+        }
+
+        .qa-item {
+            background: rgba(248, 248, 248, 0.8);
+            border: 1px solid #e0e0e0;
+            border-radius: 12px;
+            padding: 1.5rem;
+            margin-bottom: 1rem;
+        }
+
+        .qa-question {
+            font-weight: 600;
+            color: #dc2626;
+            margin-bottom: 0.8rem;
+            font-size: 1rem;
+        }
+
+        .qa-answer {
+            color: #333;
+            line-height: 1.6;
+            white-space: pre-wrap;
+        }
+
+        .qa-loading {
+            display: flex;
+            align-items: center;
+            gap: 0.8rem;
+            color: #666;
+            font-style: italic;
+        }
+
+        .no-qa {
+            text-align: center;
+            color: #999;
+            padding: 2rem;
+            font-style: italic;
+        }
+
         /* Responsive design */
         @media (max-width: 1024px) {
             .dashboard-grid {
@@ -536,12 +586,12 @@
             
             <!-- Real-time Streaming Display -->
             <div id="streamingDisplay" style="display: none; margin-bottom: 1rem;">
-                <div style="background: rgba(0, 212, 255, 0.1); border: 1px solid rgba(0, 212, 255, 0.3); border-radius: 8px; padding: 1rem;">
+                <div style="background: rgba(220, 38, 38, 0.1); border: 1px solid rgba(220, 38, 38, 0.3); border-radius: 8px; padding: 1rem;">
                     <div style="display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.5rem;">
-                        <div class="streaming-indicator" style="width: 8px; height: 8px; background: #00d4ff; border-radius: 50%; animation: pulse 1.5s infinite;"></div>
-                        <span style="font-size: 0.9rem; color: #00d4ff; font-weight: 500;">Live Description</span>
+                        <div class="streaming-indicator" style="width: 8px; height: 8px; background: #dc2626; border-radius: 50%; animation: pulse 1.5s infinite;"></div>
+                        <span style="font-size: 0.9rem; color: #dc2626; font-weight: 500;">Live Description</span>
                     </div>
-                    <div id="streamingText" style="color: #fff; font-size: 1rem; line-height: 1.4; min-height: 1.5rem; max-height: 300px; overflow-y: auto; white-space: pre-wrap; font-family: 'SF Mono', Monaco, 'Consolas', monospace;">
+                    <div id="streamingText" style="color: #333; font-size: 1rem; line-height: 1.4; min-height: 1.5rem; max-height: 300px; overflow-y: auto; white-space: pre-wrap; font-family: 'SF Mono', Monaco, 'Consolas', monospace;">
                         Waiting for description...
                     </div>
                 </div>
@@ -560,10 +610,38 @@
             <div class="summary-content" id="summaryContent">
                 <div class="summary-loading" id="summaryLoading" style="display: none;">
                     <div class="loading-spinner"></div>
-                    <div style="margin-top: 1rem; color: #ccc;">Generating summary...</div>
+                    <div style="margin-top: 1rem; color: #999;">Generating summary...</div>
                 </div>
                 <div class="summary-text" id="summaryText" style="display: none;">
                     <div style="line-height: 1.6; white-space: pre-wrap;"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Q&A Section (for alert and summary modes) -->
+        <div class="qa-section" id="qaSection" style="display: none;">
+            <div class="qa-header">
+                <h2>Ask Questions About the Video</h2>
+                <p style="color: #666; font-size: 0.9rem; margin-top: 0.5rem;">Ask questions about what happened in the processed video using AI analysis</p>
+            </div>
+            
+            <div class="qa-input-section" style="margin-bottom: 1.5rem;">
+                <div class="control-group">
+                    <label for="questionInput">Your Question:</label>
+                    <div style="display: flex; gap: 1rem;">
+                        <input type="text" id="questionInput" class="form-control" 
+                               placeholder="e.g., What activities did I see in the video?" 
+                               style="flex: 1;" onkeypress="if(event.key==='Enter') askQuestion()">
+                        <button id="askBtn" class="btn btn-primary" onclick="askQuestion()" style="white-space: nowrap;">
+                            Ask Question
+                        </button>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="qa-history" id="qaHistory">
+                <div class="no-qa" style="text-align: center; color: #999; padding: 2rem; font-style: italic;">
+                    Process a video first, then ask questions about what you observed.
                 </div>
             </div>
         </div>
